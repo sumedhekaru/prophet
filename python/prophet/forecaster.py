@@ -825,10 +825,12 @@ class Prophet:
                     name,
                     len(reg_future),
                 )
-                reg_pred = predictor.predict(reg_future, rng=rng)
+                # Pass rng only when given, so the default call is unchanged.
+                rng_kw = {} if rng is None else {'rng': rng}
+                reg_pred = predictor.predict(reg_future, **rng_kw)
                 df.loc[future_mask, name] = reg_pred['yhat'].to_numpy()
                 if n_samples and regressor_samples is not None:
-                    sample_dict = predictor.predictive_samples(reg_future, rng=rng)
+                    sample_dict = predictor.predictive_samples(reg_future, **rng_kw)
                     reg_samples = sample_dict['yhat']
                     samples_full = np.tile(
                         df[name].to_numpy()[:, None], (1, reg_samples.shape[1])
