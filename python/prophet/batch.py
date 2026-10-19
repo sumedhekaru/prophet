@@ -156,3 +156,26 @@ def kkt_violation(G, C, w, sigma, ridge, l1, tau):
         np.abs(g),
     )
     return viol.max(axis=1) / inv_tau[:, 0]
+
+
+def unsupported_reason(model) -> str | None:
+    """Why this (unfitted) model can't use the batched solver, or None if it can.
+
+    Checks the configuration only. Whether every component is additive is known only
+    after preprocessing; see `has_multiplicative_terms`.
+    """
+    if model.history is not None:
+        return 'model is already fitted'
+    if model.growth != 'linear':
+        return f'growth={model.growth!r} (only linear is supported)'
+    if model.mcmc_samples > 0:
+        return 'mcmc_samples > 0 (only MAP is supported)'
+    for name, props in model.extra_regressors.items():
+        if props.get('predictor_spec') is not None:
+            return f'regressor {name!r} has a regressor_predictor'
+    return None
+
+
+def has_multiplicative_terms(model_inputs) -> bool:
+    """True if any feature is multiplicative (then yhat is not linear in the parameters)."""
+    return bool(np.any(np.asarray(model_inputs.s_m) != 0))
