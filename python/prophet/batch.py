@@ -19,6 +19,9 @@ Only the sufficient statistics Zᵀ Z, Zᵀ y, yᵀ y and T are needed per serie
 
 from __future__ import annotations
 
+import dataclasses
+from collections import OrderedDict
+
 import numpy as np
 
 # Prior scales fixed in prophet.stan: k, m ~ normal(0, 5); sigma_obs ~ normal(0, 0.5).
@@ -252,3 +255,55 @@ def stack_problems(problems):
         l1[b, idx[2:2 + S_b]] = True
         tau[b] = tau_b
     return layout, G, C, yy, T, ridge, l1, tau
+
+
+def log_posterior(G, C, yy, T, w, sigma, ridge, l1, tau) -> np.ndarray:
+    """Log posterior per series, with the same constants dropped as Stan's lp__."""
+    Gw = np.einsum("bpq,bq->bp", G, w) if G.ndim == 3 else w @ G
+    rss = yy - 2 * np.einsum("bp,bp->b", C, w) + np.einsum("bp,bp->b", w, Gw)
+    return (-0.5 * np.sum(ridge * w ** 2, axis=1)
+            - np.sum(np.abs(w) * l1, axis=1) / tau
+            - sigma ** 2 / (2 * 0.5 ** 2)
+            - T * np.log(sigma) - rss / (2 * sigma ** 2))
+
+
+def set_params(model, k, m, delta, beta, sigma_obs, lp) -> None:
+    """Store a MAP solution on a preprocessed model in the same form as Prophet.fit."""
+    delta = np.asarray(delta, dtype=float)
+    # Stan also returns the fitted (scaled) trend over the history, a transformed parameter.
+    t = model.history['t'].to_numpy(dtype=float)
+    t_change = np.asarray(model.changepoints_t, dtype=float)
+    A = (t[:, None] >= t_change[None, :]).astype(float)
+    trend = (k + A @ delta) * t + (m + A @ (-t_change * delta))
+    model.params = OrderedDict([
+        ('lp__', np.array([[lp]], dtype=float)),
+        ('k', np.array([[k]], dtype=float)),
+        ('m', np.array([[m]], dtype=float)),
+        ('delta', delta.reshape((1, -1))),
+        ('sigma_obs', np.array([[sigma_obs]], dtype=float)),
+        ('beta', np.asarray(beta, dtype=float).reshape((1, -1))),
+        ('trend', trend.reshape((1, -1))),
+    ])
+    model.stan_fit = None
+    _fold_dummy_changepoint(model)
+
+
+def set_constant_params(model, num_regressors: int) -> None:
+    """Prophet.fit's rule for a constant history: initial params, sigma_obs = 1e-9."""
+    params = dataclasses.asdict(model.calculate_initial_params(num_regressors))
+    params['sigma_obs'] = 1e-9
+    model.params = {k: np.array(v).reshape((1, -1)) for k, v in params.items()}
+    model.stan_fit = None
+    _fold_dummy_changepoint(model)
+
+
+def is_constant(model) -> bool:
+    y = model.history['y']
+    return bool(y.min() == y.max())
+
+
+def _fold_dummy_changepoint(model) -> None:
+    # Same as Prophet.fit: with no changepoints, delta (for the dummy one at t=0) goes into k.
+    if len(model.changepoints) == 0:
+        model.params['k'] = model.params['k'] + model.params['delta'].reshape(-1)
+        model.params['delta'] = np.zeros(model.params['delta'].shape).reshape((-1, 1))
