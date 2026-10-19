@@ -39,7 +39,7 @@ _KM_PRIOR_VAR = 25.0
 # Smallest sigma_obs; same as Prophet.fit's value for a constant history.
 _MIN_SIGMA = 1e-9
 # Series per multiplicative solve (each needs its full T × p design in memory).
-_MULT_CHUNK = 256
+_MULT_CHUNK = 16
 
 
 def _feature_sign(H, c, lam, l1, w, act, s, tol, max_iter):
