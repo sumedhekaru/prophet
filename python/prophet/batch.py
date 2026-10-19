@@ -26,7 +26,7 @@ import os
 import pickle
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Callable, Hashable, Iterable, Sequence, TypeVar
+from typing import Callable, Hashable, Iterable, Sequence, TypeVar, cast
 
 import numpy as np
 import pandas as pd
@@ -141,7 +141,7 @@ def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=5
     l1 = np.asarray(l1, dtype=bool)
 
     w = np.zeros((B, p)) if w0 is None else np.array(w0, dtype=float)
-    act = ~l1 | (l1 & (w != 0))
+    act = np.logical_or(~l1, l1 & (w != 0))
     s = np.where(l1 & act, np.sign(w), 0.0)
     sigma2 = np.ones(B) if sigma0 is None else np.asarray(sigma0, dtype=float) ** 2
     live = np.arange(B)  # series whose sigma has not converged yet
@@ -318,7 +318,7 @@ def set_params(model, k, m, delta, beta, sigma_obs, lp) -> None:
         t_change = np.asarray(model.changepoints_t, dtype=float)
         A = (t[:, None] >= t_change[None, :]).astype(float)
         trend = (k + A @ delta) * t + (m + A @ (-t_change * delta))
-    model.params = OrderedDict([
+    params: OrderedDict[str, np.ndarray] = OrderedDict([
         ('lp__', np.array([[lp]], dtype=float)),
         ('k', np.array([[k]], dtype=float)),
         ('m', np.array([[m]], dtype=float)),
@@ -327,6 +327,7 @@ def set_params(model, k, m, delta, beta, sigma_obs, lp) -> None:
         ('beta', np.asarray(beta, dtype=float).reshape((1, -1))),
         ('trend', trend.reshape((1, -1))),
     ])
+    model.params = params
     model.stan_fit = None
     _fold_dummy_changepoint(model)
 
@@ -860,7 +861,8 @@ def predict_many(models, futures=None, periods=None, freq='D', include_history=T
     if (futures is None) == (periods is None):
         raise ValueError('Pass exactly one of futures or periods.')
     if seed is None:
-        seed = int(np.random.SeedSequence().entropy)
+        # Without arguments, SeedSequence draws a fresh int.
+        seed = cast(int, np.random.SeedSequence().entropy)
         logger.info('predict_many: no seed given, using seed=%d', seed)
     items = []
     for sid, model in models.items():
