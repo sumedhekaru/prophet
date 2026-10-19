@@ -76,7 +76,7 @@ def _feature_sign(
     need_step = np.ones(B, bool)
     steps = 0
     for steps in range(1, max_iter + 1):
-        g = np.einsum("bij,bj->bi", H, w) - c
+        g = np.einsum('bij,bj->bi', H, w) - c
         viol = l1 & ~act & (np.abs(g) > lam[:, None] * (1 + tol))
         ready = ~need_step & ~done
         add = ready & viol.any(axis=1)
@@ -99,11 +99,11 @@ def _feature_sign(
         # Discrete line search on the true objective: the full step, or a point where a
         # nonzero L1 coordinate changes sign.
         crossing = l1 & (w != 0) & (w * w_new < 0)
-        with np.errstate(divide="ignore", invalid="ignore"):
+        with np.errstate(divide='ignore', invalid='ignore'):
             t_cross = np.where(crossing, w / (w - w_new), np.inf)
         cand = np.concatenate([t_cross, np.ones((B, 1))], axis=1)
-        a = np.einsum("bp,bp->b", g, dw)
-        b = np.einsum("bp,bpq,bq->b", dw, H, dw)
+        a = np.einsum('bp,bp->b', g, dw)
+        b = np.einsum('bp,bpq,bq->b', dw, H, dw)
         finite = np.isfinite(cand)
         tc = np.where(finite, cand, 0.0)
         pts = w[:, None, :] + tc[:, :, None] * dw[:, None, :]
@@ -187,8 +187,8 @@ def solve_map(
         )
         inner += steps
         w[live], act[live], s[live] = wl, al, sl
-        wGw = np.einsum("bp,bpq,bq->b", wl, Gl, wl)
-        rss = np.maximum(yy[live] - 2 * np.einsum("bp,bp->b", C[live], wl) + wGw, 0.0)
+        wGw = np.einsum('bp,bpq,bq->b', wl, Gl, wl)
+        rss = np.maximum(yy[live] - 2 * np.einsum('bp,bp->b', C[live], wl) + wGw, 0.0)
         # d/dsigma of the log posterior is zero at 4 sigma⁴ + T sigma² − RSS = 0
         Tl = T[live]
         # A perfect fit (RSS = 0) makes the posterior unbounded as sigma -> 0; stop at the
@@ -216,7 +216,7 @@ def kkt_violation(
     """Largest violation of the optimality conditions for w (given sigma), per series,
     in units of the L1 threshold 1 / tau. Zero at an exact optimum."""
     C = np.asarray(C, dtype=float)
-    Gw = np.einsum("bpq,bq->bp", G, w) if G.ndim == 3 else w @ G
+    Gw = np.einsum('bpq,bq->bp', G, w) if G.ndim == 3 else w @ G
     g = (Gw - C) / sigma[:, None] ** 2 + ridge * w
     inv_tau = 1 / np.asarray(tau, dtype=float)[:, None]
     viol = np.where(
@@ -351,8 +351,8 @@ def log_posterior(
     tau: np.ndarray,
 ) -> np.ndarray:
     """Log posterior per series, with the same constants dropped as Stan's lp__."""
-    Gw = np.einsum("bpq,bq->bp", G, w) if G.ndim == 3 else w @ G
-    rss = yy - 2 * np.einsum("bp,bp->b", C, w) + np.einsum("bp,bp->b", w, Gw)
+    Gw = np.einsum('bpq,bq->bp', G, w) if G.ndim == 3 else w @ G
+    rss = yy - 2 * np.einsum('bp,bp->b', C, w) + np.einsum('bp,bp->b', w, Gw)
     return (-0.5 * np.sum(ridge * w ** 2, axis=1)
             - np.sum(np.abs(w) * l1, axis=1) / tau
             - sigma ** 2 / (2 * 0.5 ** 2)
@@ -757,7 +757,8 @@ def solve_map_multiplicative(
     """
     B, _, P = ZT.shape
     Ka, Km = Xa.shape[2], Xm.shape[2]
-    ridge_T = np.concatenate([np.full((B, 2), 1 / _KM_PRIOR_VAR), np.where(delta_mask, 0.0, 1.0)], axis=1)
+    ridge_T = np.concatenate(
+        [np.full((B, 2), 1 / _KM_PRIOR_VAR), np.where(delta_mask, 0.0, 1.0)], axis=1)
     l1_T = np.concatenate([np.zeros((B, 2), bool), delta_mask], axis=1)
     ridge_J = np.concatenate([ridge_T, ridge_a, ridge_m], axis=1)
     l1_J = np.concatenate([l1_T, np.zeros((B, Ka + Km), bool)], axis=1)
@@ -784,28 +785,32 @@ def solve_map_multiplicative(
             wgt = 1 + np.matmul(Xm[L], bm[L][:, :, None])[..., 0]
             ZA = np.concatenate([wgt[:, :, None] * ZT[L], Xa[L]], axis=2)
             G, C, yy = _gram(ZA, y[L])
-            wA, sigma[L] = solve_map(G, C, yy, T[L], np.concatenate([ridge_T[L], ridge_a[L]], axis=1),
-                                     np.concatenate([l1_T[L], np.zeros((len(L), Ka), bool)], axis=1),
-                                     tau[L], w0=np.concatenate([theta[L], ba[L]], axis=1), sigma0=sigma[L])
+            wA, sigma[L] = solve_map(
+                G, C, yy, T[L], np.concatenate([ridge_T[L], ridge_a[L]], axis=1),
+                np.concatenate([l1_T[L], np.zeros((len(L), Ka), bool)], axis=1),
+                tau[L], w0=np.concatenate([theta[L], ba[L]], axis=1), sigma0=sigma[L])
             theta[L], ba[L] = wA[:, :P], wA[:, P:]
             trend = np.matmul(ZT[L], theta[L][:, :, None])[..., 0]
             ZB = np.concatenate([trend[:, :, None] * Xm[L], Xa[L]], axis=2)
             G, C, yy = _gram(ZB, y[L] - trend)
-            wB, sigma[L] = solve_map(G, C, yy, T[L], np.concatenate([ridge_m[L], ridge_a[L]], axis=1),
-                                     np.zeros((len(L), Km + Ka), bool), tau[L],
-                                     w0=np.concatenate([bm[L], ba[L]], axis=1), sigma0=sigma[L])
+            wB, sigma[L] = solve_map(
+                G, C, yy, T[L], np.concatenate([ridge_m[L], ridge_a[L]], axis=1),
+                np.zeros((len(L), Km + Ka), bool), tau[L],
+                w0=np.concatenate([bm[L], ba[L]], axis=1), sigma0=sigma[L])
             bm[L], ba[L] = wB[:, :Km], wB[:, Km:]
             lp_new = lp_at(L, theta[L], ba[L], bm[L], sigma[L])
         else:
             # Linearize yhat around p = [θ, β_a, β_m]: yhat(p') ≈ yhat(p) + J (p' − p).
             trend = np.matmul(ZT[L], theta[L][:, :, None])[..., 0]
             mult = 1 + np.matmul(Xm[L], bm[L][:, :, None])[..., 0]
-            J = np.concatenate([mult[:, :, None] * ZT[L], Xa[L], trend[:, :, None] * Xm[L]], axis=2)
+            J = np.concatenate(
+                [mult[:, :, None] * ZT[L], Xa[L], trend[:, :, None] * Xm[L]], axis=2)
             p_cur = np.concatenate([theta[L], ba[L], bm[L]], axis=1)
             yhat = trend * mult + np.matmul(Xa[L], ba[L][:, :, None])[..., 0]
             y_lin = y[L] - yhat + np.matmul(J, p_cur[:, :, None])[..., 0]
             G, C, yy = _gram(J, y_lin)
-            p_new, _ = solve_map(G, C, yy, T[L], ridge_J[L], l1_J[L], tau[L], w0=p_cur, sigma0=sigma[L])
+            p_new, _ = solve_map(G, C, yy, T[L], ridge_J[L], l1_J[L], tau[L],
+                                 w0=p_cur, sigma0=sigma[L])
             # Backtrack until the true log posterior doesn't decrease; sigma is set to its
             # closed-form optimum at each trial point.
             step = np.ones(len(L))
@@ -816,9 +821,11 @@ def solve_map_multiplicative(
                 trial = p_cur + step[:, None] * (p_new - p_cur)
                 th, a, m = trial[:, :P], trial[:, P:P + Ka], trial[:, P + Ka:]
                 tr = np.matmul(ZT[L], th[:, :, None])[..., 0]
-                yh = tr * (1 + np.matmul(Xm[L], m[:, :, None])[..., 0]) + np.matmul(Xa[L], a[:, :, None])[..., 0]
+                yh = (tr * (1 + np.matmul(Xm[L], m[:, :, None])[..., 0])
+                      + np.matmul(Xa[L], a[:, :, None])[..., 0])
                 rss = np.sum((y[L] - yh) ** 2, axis=1)
-                sg = np.sqrt(np.maximum((-T[L] + np.sqrt(T[L] ** 2 + 16 * rss)) / 8, _MIN_SIGMA ** 2))
+                sg = np.sqrt(np.maximum((-T[L] + np.sqrt(T[L] ** 2 + 16 * rss)) / 8,
+                                        _MIN_SIGMA ** 2))
                 lp_try = lp_at(L, th, a, m, sg)
                 ok = ~accepted & (lp_try >= lp_cur)
                 p_acc[ok], s_acc[ok], lp_acc[ok] = trial[ok], sg[ok], lp_try[ok]
@@ -951,7 +958,8 @@ def series_rng(seed: int, series_id: Hashable) -> np.random.Generator:
     Independent of how many series there are, their order, and which process or batch
     handles them, so parallel predictions are reproducible.
     """
-    return np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(stable_id_hash(series_id),)))
+    return np.random.default_rng(
+        np.random.SeedSequence(seed, spawn_key=(stable_id_hash(series_id),)))
 
 
 def _predict_chunk(
@@ -961,7 +969,8 @@ def _predict_chunk(
 ) -> list[tuple[Hashable, pd.DataFrame]]:
     """Worker: predict a list of (series_id, model, future) with per-series generators."""
     return [
-        (sid, model.predict(future, history_uncertainty=history_uncertainty, rng=series_rng(seed, sid)))
+        (sid, model.predict(future, history_uncertainty=history_uncertainty,
+                            rng=series_rng(seed, sid)))
         for sid, model, future in items
     ]
 
@@ -1005,7 +1014,8 @@ def predict_many(
     items = []
     for sid, model in models.items():
         future = (futures[sid] if futures is not None
-                  else model.make_future_dataframe(cast(int, periods), freq=freq, include_history=include_history))
+                  else model.make_future_dataframe(cast(int, periods), freq=freq,
+                                                   include_history=include_history))
         items.append((sid, model, future))
 
     n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
