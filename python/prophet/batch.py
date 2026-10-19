@@ -714,6 +714,21 @@ def solve_map_multiplicative(ZT, Xa, Xm, y, T, delta_mask, ridge_a, ridge_m, tau
     return theta, ba, bm, sigma, lp, it
 
 
+@dataclasses.dataclass
+class _MultSeries:
+    """One series' arrays for `_MultiplicativeBatch`."""
+    ZT: np.ndarray   # trend columns of the design matrix, T × (2 + S)
+    Xa: np.ndarray   # additive features
+    Xm: np.ndarray   # multiplicative features
+    y: np.ndarray
+    ia: np.ndarray   # feature indices of the Xa columns
+    im: np.ndarray   # feature indices of the Xm columns
+    sig: np.ndarray  # prior scales of all K features
+    S: int
+    K: int
+    tau: float
+
+
 class _MultiplicativeBatch:
     """Zero-padded arrays for `solve_map_multiplicative`, built from model inputs."""
 
@@ -726,14 +741,16 @@ class _MultiplicativeBatch:
             X = np.asarray(inputs.X, dtype=float)
             s_m = np.asarray(inputs.s_m, dtype=float) != 0
             sig = np.asarray(inputs.sigmas, dtype=float)
-            parts.append(dict(ZT=Z[:, :2 + S], Xa=X[:, ~s_m], Xm=X[:, s_m], y=np.asarray(inputs.y, float),
-                              ia=np.flatnonzero(~s_m), im=np.flatnonzero(s_m), sig=sig, S=S,
-                              K=len(sig), tau=float(inputs.tau)))
+            parts.append(_MultSeries(
+                ZT=Z[:, :2 + S], Xa=X[:, ~s_m], Xm=X[:, s_m], y=np.asarray(inputs.y, float),
+                ia=np.flatnonzero(~s_m), im=np.flatnonzero(s_m), sig=sig, S=S,
+                K=len(sig), tau=float(inputs.tau),
+            ))
         self.parts = parts
-        Tm = max(len(p['y']) for p in parts)
-        Sm = max(p['S'] for p in parts)
-        Ka = max(p['Xa'].shape[1] for p in parts)
-        Km = max(p['Xm'].shape[1] for p in parts)
+        Tm = max(len(p.y) for p in parts)
+        Sm = max(p.S for p in parts)
+        Ka = max(p.Xa.shape[1] for p in parts)
+        Km = max(p.Xm.shape[1] for p in parts)
         self.ZT = np.zeros((B, Tm, 2 + Sm))
         self.Xa = np.zeros((B, Tm, Ka))
         self.Xm = np.zeros((B, Tm, Km))
@@ -744,16 +761,16 @@ class _MultiplicativeBatch:
         self.ridge_m = np.ones((B, Km))
         self.tau = np.zeros(B)
         for b, p in enumerate(parts):
-            T, S = len(p['y']), p['S']
-            self.ZT[b, :T, :2 + S] = p['ZT']
-            self.Xa[b, :T, :p['Xa'].shape[1]] = p['Xa']
-            self.Xm[b, :T, :p['Xm'].shape[1]] = p['Xm']
-            self.y[b, :T] = p['y']
+            T, S = len(p.y), p.S
+            self.ZT[b, :T, :2 + S] = p.ZT
+            self.Xa[b, :T, :p.Xa.shape[1]] = p.Xa
+            self.Xm[b, :T, :p.Xm.shape[1]] = p.Xm
+            self.y[b, :T] = p.y
             self.T[b] = T
             self.delta_mask[b, :S] = True
-            self.ridge_a[b, :len(p['ia'])] = 1 / p['sig'][p['ia']] ** 2
-            self.ridge_m[b, :len(p['im'])] = 1 / p['sig'][p['im']] ** 2
-            self.tau[b] = p['tau']
+            self.ridge_a[b, :len(p.ia)] = 1 / p.sig[p.ia] ** 2
+            self.ridge_m[b, :len(p.im)] = 1 / p.sig[p.im] ** 2
+            self.tau[b] = p.tau
 
     def solve(self, **kw):
         return solve_map_multiplicative(self.ZT, self.Xa, self.Xm, self.y, self.T, self.delta_mask,
@@ -762,10 +779,10 @@ class _MultiplicativeBatch:
     def unpack(self, b, theta, ba, bm):
         """(k, m, delta, beta) for series b, with beta in the model's feature order."""
         p = self.parts[b]
-        beta = np.zeros(p['K'])
-        beta[p['ia']] = ba[b, :len(p['ia'])]
-        beta[p['im']] = bm[b, :len(p['im'])]
-        return float(theta[b, 0]), float(theta[b, 1]), theta[b, 2:2 + p['S']].copy(), beta
+        beta = np.zeros(p.K)
+        beta[p.ia] = ba[b, :len(p.ia)]
+        beta[p.im] = bm[b, :len(p.im)]
+        return float(theta[b, 0]), float(theta[b, 1]), theta[b, 2:2 + p.S].copy(), beta
 
 
 def _as_additive(inputs):
