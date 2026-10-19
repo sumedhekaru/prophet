@@ -26,6 +26,7 @@ import os
 import pickle
 from collections import OrderedDict
 from copy import deepcopy
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -353,12 +354,13 @@ def _fold_dummy_changepoint(model) -> None:
 class _SharedFeatures:
     """Date-only preprocessing results, reusable by models with the same configuration
     and the same history dates."""
-    X: object               # seasonal features DataFrame
-    sigmas: list
-    component_cols: object  # DataFrame
+    X: Sequence[Sequence[float]] | pd.DataFrame  # seasonal features
+    K: int
+    sigmas: Sequence[float]
+    component_cols: pd.DataFrame
     modes: dict
-    train_holiday_names: object
-    Z: np.ndarray           # design matrix
+    train_holiday_names: pd.Series | None
+    Z: np.ndarray | None    # design matrix; None if multiplicative
 
 
 def _history_key(df) -> bytes:
@@ -389,7 +391,7 @@ def _preprocess_shared(model, df, shared: _SharedFeatures) -> ModelInputData:
     return ModelInputData(
         T=model.history.shape[0],
         S=len(model.changepoints_t),
-        K=shared.X.shape[1],
+        K=shared.K,
         tau=model.changepoint_prior_scale,
         trend_indicator=TrendIndicator[model.growth.upper()].value,
         y=model.history['y_scaled'],
@@ -422,16 +424,14 @@ def _prepare(df, id_col, make_model, share_dates):
         if reason is not None:
             fallback.append((sid, series_df, reason))
             continue
-        shared = None
-        if share_dates:
-            key = _history_key(series_df)
-            shared = shared_by_dates.get(key)
+        key = _history_key(series_df) if share_dates else None
+        shared = shared_by_dates.get(key) if key is not None else None
         if shared is None:
             inputs = model.preprocess(series_df)
             Z = None if has_multiplicative_terms(inputs) else design_matrix(inputs)
-            if share_dates:
+            if key is not None:
                 shared_by_dates[key] = _SharedFeatures(
-                    X=inputs.X, sigmas=inputs.sigmas, component_cols=model.train_component_cols,
+                    X=inputs.X, K=inputs.K, sigmas=inputs.sigmas, component_cols=model.train_component_cols,
                     modes=model.component_modes, train_holiday_names=model.train_holiday_names, Z=Z,
                 )
         else:
