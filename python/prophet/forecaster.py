@@ -29,13 +29,14 @@ from prophet.models import StanBackendEnum, ModelInputData, ModelParams, TrendIn
 from prophet.plot import plot, plot_components
 
 logger: logging.Logger = logging.getLogger('prophet')
+logger.setLevel(logging.INFO)
+NANOSECONDS_TO_SECONDS = 1000 * 1000 * 1000
 
 
 def _random(rng: np.random.Generator | None) -> Any:
     """The source of random draws: the given Generator, or NumPy's global RNG (default)."""
     return np.random if rng is None else rng
-logger.setLevel(logging.INFO)
-NANOSECONDS_TO_SECONDS = 1000 * 1000 * 1000
+
 
 class Prophet:
     """Prophet forecaster.
@@ -1910,7 +1911,8 @@ class Prophet:
                         beta * s_a.values) * self.y_scale
         Xb_m = np.matmul(seasonal_features.values, beta * s_m.values)
         # Get the future trend, which is stochastic per iteration
-        trends = self.sample_predictive_trend_vectorized(df, n_samples, iteration, rng=rng)  # already on the same scale as the actual data
+        trends = self.sample_predictive_trend_vectorized(
+            df, n_samples, iteration, rng=rng)  # already on the same scale as the actual data
         sigma = self.params['sigma_obs'][iteration]
         noise_terms = _random(rng).normal(0, sigma, trends.shape) * cast(float, self.y_scale)
 
@@ -2062,11 +2064,13 @@ class Prophet:
             k = self.params["k"][iteration]
             mean_delta = np.mean(np.abs(deltas)) + 1e-8
             if self.growth == "linear":
-                mat = self._make_trend_shift_matrix(mean_delta, change_likelihood, n_length, n_samples=n_samples, rng=rng)
+                mat = self._make_trend_shift_matrix(
+                    mean_delta, change_likelihood, n_length, n_samples=n_samples, rng=rng)
                 uncertainties = mat.cumsum(axis=1).cumsum(axis=1)  # from slope changes to actual values
                 uncertainties *= single_diff  # scaled by the actual meaning of the slope
             elif self.growth == "logistic":
-                mat = self._make_trend_shift_matrix(mean_delta, change_likelihood, n_length, n_samples=n_samples, rng=rng)
+                mat = self._make_trend_shift_matrix(
+                    mean_delta, change_likelihood, n_length, n_samples=n_samples, rng=rng)
                 uncertainties = self._logistic_uncertainty(
                     mat=mat,
                     deltas=deltas,
