@@ -180,8 +180,8 @@ def unsupported_reason(model) -> str | None:
     """
     if model.history is not None:
         return 'model is already fitted'
-    if model.growth != 'linear':
-        return f'growth={model.growth!r} (only linear is supported)'
+    if model.growth not in ('linear', 'flat'):
+        return f'growth={model.growth!r} (only linear and flat are supported)'
     if model.mcmc_samples > 0:
         return 'mcmc_samples > 0 (only MAP is supported)'
     for name, props in model.extra_regressors.items():
@@ -198,13 +198,21 @@ def has_multiplicative_terms(model_inputs) -> bool:
 def design_matrix(model_inputs) -> np.ndarray:
     """Z such that the fitted values (scaled) are Z @ [k, m, delta, beta].
 
-    Valid for linear growth with additive components only.
+    Valid for linear or flat growth with additive components only. For flat growth the
+    trend is just m, so the k and delta columns are zero (they only feel their priors,
+    and solve to exactly 0).
     """
     t = np.asarray(model_inputs.t, dtype=float)
     t_change = np.asarray(model_inputs.t_change, dtype=float)
     X = np.asarray(model_inputs.X, dtype=float) * np.asarray(model_inputs.s_a, dtype=float)
     hinge = (t[:, None] >= t_change[None, :]) * (t[:, None] - t_change[None, :])
-    return np.column_stack([t, np.ones_like(t), hinge, X])
+    Z = np.column_stack([t, np.ones_like(t), hinge, X])
+    if model_inputs.trend_indicator == TrendIndicator.FLAT.value:
+        Z[:, 0] = 0.0
+        Z[:, 2:2 + len(t_change)] = 0.0
+    elif model_inputs.trend_indicator != TrendIndicator.LINEAR.value:
+        raise ValueError('only linear and flat growth have a linear design matrix')
+    return Z
 
 
 class _Layout:
@@ -286,9 +294,12 @@ def set_params(model, k, m, delta, beta, sigma_obs, lp) -> None:
     delta = np.asarray(delta, dtype=float)
     # Stan also returns the fitted (scaled) trend over the history, a transformed parameter.
     t = model.history['t'].to_numpy(dtype=float)
-    t_change = np.asarray(model.changepoints_t, dtype=float)
-    A = (t[:, None] >= t_change[None, :]).astype(float)
-    trend = (k + A @ delta) * t + (m + A @ (-t_change * delta))
+    if model.growth == 'flat':
+        trend = np.full(len(t), float(m))
+    else:
+        t_change = np.asarray(model.changepoints_t, dtype=float)
+        A = (t[:, None] >= t_change[None, :]).astype(float)
+        trend = (k + A @ delta) * t + (m + A @ (-t_change * delta))
     model.params = OrderedDict([
         ('lp__', np.array([[lp]], dtype=float)),
         ('k', np.array([[k]], dtype=float)),
