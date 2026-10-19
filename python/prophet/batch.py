@@ -29,6 +29,8 @@ logger = logging.getLogger('prophet.batch')
 
 # Prior scales fixed in prophet.stan: k, m ~ normal(0, 5); sigma_obs ~ normal(0, 0.5).
 _KM_PRIOR_VAR = 25.0
+# Smallest sigma_obs; same as Prophet.fit's value for a constant history.
+_MIN_SIGMA = 1e-9
 
 
 def _feature_sign(H, c, lam, l1, w, act, s, tol, max_iter):
@@ -140,7 +142,9 @@ def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=5
         rss = np.maximum(yy[live] - 2 * np.einsum("bp,bp->b", C[live], wl) + wGw, 0.0)
         # d/dsigma of the log posterior is zero at 4 sigma⁴ + T sigma² − RSS = 0
         Tl = T[live]
-        s2_new = np.maximum((-Tl + np.sqrt(Tl * Tl + 16 * rss)) / 8, 1e-300)
+        # A perfect fit (RSS = 0) makes the posterior unbounded as sigma -> 0; stop at the
+        # sigma_obs Prophet.fit uses for a constant history.
+        s2_new = np.maximum((-Tl + np.sqrt(Tl * Tl + 16 * rss)) / 8, _MIN_SIGMA ** 2)
         converged = np.abs(s2_new - s2) / s2 < tol
         sigma2[live] = s2_new
         live = live[~converged]
