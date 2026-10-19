@@ -26,7 +26,7 @@ import os
 import pickle
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Sequence
+from typing import Callable, Hashable, Iterable, Sequence, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,8 @@ import pandas as pd
 from prophet.models import ModelInputData, TrendIndicator
 
 logger = logging.getLogger('prophet.batch')
+
+_T = TypeVar('_T')
 
 # Prior scales fixed in prophet.stan: k, m ~ normal(0, 5); sigma_obs ~ normal(0, 0.5).
 _KM_PRIOR_VAR = 25.0
@@ -447,9 +449,9 @@ def _prepare(df, id_col, make_model, share_dates):
     return order, batch, mult, constant, fallback
 
 
-def _group_by(items, key):
+def _group_by(items: Iterable[_T], key: Callable[[_T], Hashable]) -> list[list[_T]]:
     """Group items by key, keeping first-appearance order of groups and items."""
-    groups = {}
+    groups: dict[Hashable, list[_T]] = {}
     for item in items:
         groups.setdefault(key(item), []).append(item)
     return list(groups.values())
