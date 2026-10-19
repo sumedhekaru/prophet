@@ -29,6 +29,11 @@ from prophet.models import StanBackendEnum, ModelInputData, ModelParams, TrendIn
 from prophet.plot import plot, plot_components
 
 logger: logging.Logger = logging.getLogger('prophet')
+
+
+def _random(rng: np.random.Generator | None) -> Any:
+    """The source of random draws: the given Generator, or NumPy's global RNG (default)."""
+    return np.random if rng is None else rng
 logger.setLevel(logging.INFO)
 NANOSECONDS_TO_SECONDS = 1000 * 1000 * 1000
 
@@ -787,7 +792,8 @@ class Prophet:
             props['predictor'] = predictor
 
     def _prepare_regressors_for_predict(
-        self, df: pd.DataFrame, n_samples: int | None = None
+        self, df: pd.DataFrame, n_samples: int | None = None,
+        rng: np.random.Generator | None = None,
     ) -> tuple[pd.DataFrame, dict[str, npt.NDArray[np.float64]] | None]:
         """Populate regressor columns using fitted regressor models if present.
 
@@ -826,10 +832,10 @@ class Prophet:
                     name,
                     len(reg_future),
                 )
-                reg_pred = predictor.predict(reg_future)
+                reg_pred = predictor.predict(reg_future, rng=rng)
                 df.loc[future_mask, name] = reg_pred['yhat'].to_numpy()
                 if n_samples and regressor_samples is not None:
-                    sample_dict = predictor.predictive_samples(reg_future)
+                    sample_dict = predictor.predictive_samples(reg_future, rng=rng)
                     reg_samples = sample_dict['yhat']
                     samples_full = np.tile(
                         df[name].to_numpy()[:, None], (1, reg_samples.shape[1])
@@ -1465,6 +1471,7 @@ class Prophet:
         df: pd.DataFrame | None = None,
         vectorized: bool = True,
         history_uncertainty: bool = True,
+        rng: np.random.Generator | None = None,
     ) -> pd.DataFrame:
         """Predict using the prophet model.
 
@@ -1481,6 +1488,8 @@ class Prophet:
             computes them for every row. False leaves them NaN for history rows and only
             samples the future rows, which is much faster when the history is included;
             the future intervals are then exactly those of predicting the future rows alone.
+        rng: Optional numpy Generator for all random draws (uncertainty intervals,
+            regressor models). None (the default) uses NumPy's global RNG, as before.
 
         Returns
         -------
@@ -1498,6 +1507,7 @@ class Prophet:
             df, regressor_samples = self._prepare_regressors_for_predict(
                 df.copy(),
                 self.uncertainty_samples if self.uncertainty_samples else None,
+                rng=rng,
             )
             df = self.setup_dataframe(df)
 
@@ -1512,9 +1522,9 @@ class Prophet:
         seasonal_components = self.predict_seasonal_components(df)
         if self.uncertainty_samples:
             if history_uncertainty:
-                intervals = self.predict_uncertainty(df, vectorized, regressor_samples)
+                intervals = self.predict_uncertainty(df, vectorized, regressor_samples, rng=rng)
             else:
-                intervals = self._future_uncertainty(df, vectorized, regressor_samples)
+                intervals = self._future_uncertainty(df, vectorized, regressor_samples, rng=rng)
         else:
             intervals = None
 
@@ -1694,6 +1704,7 @@ class Prophet:
         df: pd.DataFrame,
         vectorized: bool,
         regressor_samples: dict[str, npt.NDArray[np.float64]] | None = None,
+        rng: np.random.Generator | None = None,
     ) -> pd.DataFrame:
         """Prediction intervals for yhat and trend.
 
@@ -1708,7 +1719,7 @@ class Prophet:
         -------
         Dataframe with uncertainty intervals.
         """
-        sim_values = self.sample_posterior_predictive(df, vectorized, regressor_samples)
+        sim_values = self.sample_posterior_predictive(df, vectorized, regressor_samples, rng=rng)
 
         lower_p = 100 * (1.0 - self.interval_width) / 2
         upper_p = 100 * (1.0 + self.interval_width) / 2
@@ -1727,6 +1738,7 @@ class Prophet:
         df: pd.DataFrame,
         vectorized: bool,
         regressor_samples: dict[str, npt.NDArray[np.float64]] | None = None,
+        rng: np.random.Generator | None = None,
     ) -> pd.DataFrame:
         """predict_uncertainty for future rows (t > 1) only; NaN for history rows."""
         future = (df['t'] > 1).to_numpy()
@@ -1737,7 +1749,7 @@ class Prophet:
             if regressor_samples:
                 future_samples = {k: v[future] for k, v in regressor_samples.items()}
             future_intervals = self.predict_uncertainty(
-                df.loc[future].reset_index(drop=True), vectorized, future_samples)
+                df.loc[future].reset_index(drop=True), vectorized, future_samples, rng=rng)
             intervals.loc[future, columns] = future_intervals[columns].to_numpy()
         return intervals
 
@@ -1746,6 +1758,7 @@ class Prophet:
         df: pd.DataFrame,
         vectorized: bool,
         regressor_samples: dict[str, np.ndarray] | None = None,
+        rng: np.random.Generator | None = None,
     ) -> dict[str, npt.NDArray[np.float64]]:
         """Prophet posterior predictive samples.
 
@@ -1794,7 +1807,8 @@ class Prophet:
                     iteration=i,
                     s_a=component_cols['additive_terms'],
                     s_m=component_cols['multiplicative_terms'],
-                    n_samples=samp_per_iter
+                    n_samples=samp_per_iter,
+                    rng=rng,
                 )
             else:
                 sims = []
@@ -1815,6 +1829,7 @@ class Prophet:
                             iteration=i,
                             s_a=component_cols['additive_terms'],
                             s_m=component_cols['multiplicative_terms'],
+                            rng=rng,
                         )
                     )
                     sample_counter += 1
@@ -1831,6 +1846,7 @@ class Prophet:
         iteration: int,
         s_a: pd.Series,
         s_m: pd.Series,
+        rng: np.random.Generator | None = None,
     ) -> dict[str, npt.NDArray[np.float64]]:
         """Simulate observations from the extrapolated generative model.
 
@@ -1846,7 +1862,7 @@ class Prophet:
         -------
         Dictionary with `yhat` and `trend`, each like df['t'].
         """
-        trend = self.sample_predictive_trend(df, iteration)
+        trend = self.sample_predictive_trend(df, iteration, rng=rng)
 
         y_scale = cast(float, self.y_scale)
         beta = self.params['beta'][iteration]
@@ -1855,7 +1871,7 @@ class Prophet:
         Xb_m = np.matmul(seasonal_features.values, beta * s_m.values)
 
         sigma = self.params['sigma_obs'][iteration]
-        noise = np.random.normal(0, sigma, df.shape[0]) * y_scale
+        noise = _random(rng).normal(0, sigma, df.shape[0]) * y_scale
 
         return {
             'yhat': trend * (1 + Xb_m) + Xb_a + noise,
@@ -1870,6 +1886,7 @@ class Prophet:
         s_a: pd.Series,
         s_m: pd.Series,
         n_samples: int,
+        rng: np.random.Generator | None = None,
     ) -> list[dict[str, np.ndarray]]:
         """Simulate observations from the extrapolated generative model. Vectorized version of sample_model().
 
@@ -1892,9 +1909,9 @@ class Prophet:
                         beta * s_a.values) * self.y_scale
         Xb_m = np.matmul(seasonal_features.values, beta * s_m.values)
         # Get the future trend, which is stochastic per iteration
-        trends = self.sample_predictive_trend_vectorized(df, n_samples, iteration)  # already on the same scale as the actual data
+        trends = self.sample_predictive_trend_vectorized(df, n_samples, iteration, rng=rng)  # already on the same scale as the actual data
         sigma = self.params['sigma_obs'][iteration]
-        noise_terms = np.random.normal(0, sigma, trends.shape) * cast(float, self.y_scale)
+        noise_terms = _random(rng).normal(0, sigma, trends.shape) * cast(float, self.y_scale)
 
         simulations = []
         for trend, noise in zip(trends, noise_terms):
@@ -1904,7 +1921,9 @@ class Prophet:
             })
         return simulations
 
-    def sample_predictive_trend(self, df: pd.DataFrame, iteration: int) -> np.ndarray:
+    def sample_predictive_trend(
+        self, df: pd.DataFrame, iteration: int, rng: np.random.Generator | None = None
+    ) -> np.ndarray:
         """Simulate the trend using the extrapolated generative model.
 
         Parameters
@@ -1927,11 +1946,11 @@ class Prophet:
         changepoints_t = cast(np.ndarray, self.changepoints_t)
         if T > 1:
             S = len(changepoints_t)
-            n_changes = np.random.poisson(S * (T - 1))
+            n_changes = _random(rng).poisson(S * (T - 1))
         else:
             n_changes = 0
         if n_changes > 0:
-            changepoint_ts_new = 1 + np.random.rand(n_changes) * (T - 1)
+            changepoint_ts_new = 1 + _random(rng).random(n_changes) * (T - 1)
             changepoint_ts_new.sort()
         else:
             changepoint_ts_new = []
@@ -1940,7 +1959,7 @@ class Prophet:
         lambda_ = np.mean(np.abs(deltas)) + 1e-8
 
         # Sample deltas
-        deltas_new = np.random.laplace(0, lambda_, n_changes)
+        deltas_new = _random(rng).laplace(0, lambda_, n_changes)
 
         # Prepend the times and deltas from the history
         changepoint_ts = np.concatenate((changepoints_t,
@@ -1964,6 +1983,7 @@ class Prophet:
         df: pd.DataFrame,
         n_samples: int,
         iteration: int = 0,
+        rng: np.random.Generator | None = None,
     ) -> np.ndarray[tuple[int, int], np.dtype[np.float64]]:
         """Sample draws of the future trend values. Vectorized version of sample_predictive_trend().
 
@@ -1998,7 +2018,7 @@ class Prophet:
             expected = self.flat_trend(cast(np.ndarray, df["t"].values), m)
         else:
             raise NotImplementedError
-        uncertainty = self._sample_uncertainty(df, n_samples, iteration)
+        uncertainty = self._sample_uncertainty(df, n_samples, iteration, rng=rng)
         return (
             (np.tile(expected, (n_samples, 1)) + uncertainty) * cast(float, self.y_scale) +
             np.tile(cast(np.ndarray, df["floor"].values), (n_samples, 1))
@@ -2009,6 +2029,7 @@ class Prophet:
         df: pd.DataFrame,
         n_samples: int,
         iteration: int = 0,
+        rng: np.random.Generator | None = None,
     ) -> np.ndarray[tuple[int, int], np.dtype[np.float64]]:
         """Sample draws of future trend changes, vectorizing as much as possible.
 
@@ -2040,11 +2061,11 @@ class Prophet:
             k = self.params["k"][iteration]
             mean_delta = np.mean(np.abs(deltas)) + 1e-8
             if self.growth == "linear":
-                mat = self._make_trend_shift_matrix(mean_delta, change_likelihood, n_length, n_samples=n_samples)
+                mat = self._make_trend_shift_matrix(mean_delta, change_likelihood, n_length, n_samples=n_samples, rng=rng)
                 uncertainties = mat.cumsum(axis=1).cumsum(axis=1)  # from slope changes to actual values
                 uncertainties *= single_diff  # scaled by the actual meaning of the slope
             elif self.growth == "logistic":
-                mat = self._make_trend_shift_matrix(mean_delta, change_likelihood, n_length, n_samples=n_samples)
+                mat = self._make_trend_shift_matrix(mean_delta, change_likelihood, n_length, n_samples=n_samples, rng=rng)
                 uncertainties = self._logistic_uncertainty(
                     mat=mat,
                     deltas=deltas,
@@ -2068,7 +2089,8 @@ class Prophet:
 
     @staticmethod
     def _make_trend_shift_matrix(
-        mean_delta: float, likelihood: float, future_length: int, n_samples: int
+        mean_delta: float, likelihood: float, future_length: int, n_samples: int,
+        rng: np.random.Generator | None = None,
     ) -> np.ndarray[tuple[int, int], np.dtype[np.float64]]:
         """
         Creates a matrix of random trend shifts based on historical likelihood and size of shifts.
@@ -2076,8 +2098,8 @@ class Prophet:
         Each row represents a different sample of a possible future, and each column is a time step into the future.
         """
         # create a bool matrix of where these trend shifts should go
-        bool_slope_change = np.random.uniform(size=(n_samples, future_length)) < likelihood
-        shift_values = np.random.laplace(0, mean_delta, size=bool_slope_change.shape)
+        bool_slope_change = _random(rng).uniform(size=(n_samples, future_length)) < likelihood
+        shift_values = _random(rng).laplace(0, mean_delta, size=bool_slope_change.shape)
         mat = shift_values * bool_slope_change
         n_mat = np.hstack([np.zeros((len(mat), 1)), mat])[:, :-1]
         mat = (n_mat + mat) / 2
@@ -2169,7 +2191,9 @@ class Prophet:
         # we will add the width to the main forecast - yhat (which is the mean) - later
         return sample_trends - sample_trends.mean(axis=0)
 
-    def predictive_samples(self, df: pd.DataFrame, vectorized: bool = True) -> dict[str, npt.NDArray[np.float64]]:
+    def predictive_samples(
+        self, df: pd.DataFrame, vectorized: bool = True, rng: np.random.Generator | None = None
+    ) -> dict[str, npt.NDArray[np.float64]]:
         """Sample from the posterior predictive distribution. Returns samples
         for the main estimate yhat, and for the trend component. The shape of
         each output will be (nforecast x nsamples), where nforecast is the
@@ -2185,6 +2209,7 @@ class Prophet:
         vectorized: Whether to use a vectorized method to compute possible draws. Suggest using
             True (the default) for much faster runtimes in most cases,
             except when (growth = 'logistic' and mcmc_samples > 0).
+        rng: Optional numpy Generator for the random draws; None uses NumPy's global RNG.
 
         Returns
         -------
@@ -2195,6 +2220,7 @@ class Prophet:
         df, regressor_samples = self._prepare_regressors_for_predict(
             df.copy(),
             self.uncertainty_samples if self.uncertainty_samples else None,
+            rng=rng,
         )
         df = self.setup_dataframe(df)
         if regressor_samples:
@@ -2203,7 +2229,7 @@ class Prophet:
                 props = self.extra_regressors[name]
                 standardized_samples[name] = (samples - props['mu']) / props['std']
             regressor_samples = standardized_samples
-        return self.sample_posterior_predictive(df, vectorized, regressor_samples)
+        return self.sample_posterior_predictive(df, vectorized, regressor_samples, rng=rng)
 
     def percentile(self, a: npt.ArrayLike, *args: Any, **kwargs: Any) -> np.ndarray:
         """
