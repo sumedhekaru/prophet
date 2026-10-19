@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import logging
+import os
 from collections import OrderedDict
 from copy import deepcopy
 
@@ -737,3 +738,64 @@ def series_rng(seed: int, series_id) -> np.random.Generator:
     handles them, so parallel predictions are reproducible.
     """
     return np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(stable_id_hash(series_id),)))
+
+
+def _predict_chunk(items, seed, history_uncertainty):
+    """Worker: predict a list of (series_id, model, future) with per-series generators."""
+    return [
+        (sid, model.predict(future, history_uncertainty=history_uncertainty, rng=series_rng(seed, sid)))
+        for sid, model, future in items
+    ]
+
+
+def predict_many(models, futures=None, periods=None, freq='D', include_history=True,
+                 seed=None, n_jobs=1, history_uncertainty=True):
+    """Forecast many fitted models, reproducibly, optionally in parallel.
+
+    Parameters
+    ----------
+    models: Dict mapping series id to a fitted Prophet model (e.g. from fit_many).
+    futures: Optional dict mapping series id to its future DataFrame (needed when
+        models use extra regressors or logistic caps). Give either futures or periods.
+    periods, freq, include_history: Build each future with
+        model.make_future_dataframe(periods, freq, include_history).
+    seed: Integer seed. Each series draws from series_rng(seed, series_id), so a
+        series' forecast depends only on (seed, series id, model, future): not on
+        n_jobs, order, or which other series are predicted. None draws a fresh seed,
+        which is logged and stored in every forecast's `attrs['seed']`.
+    n_jobs: Number of worker processes; 1 runs in this process, -1 uses all CPUs.
+    history_uncertainty: Passed to Prophet.predict.
+
+    Returns
+    -------
+    Dict mapping series id to its forecast DataFrame, in the order of `models`.
+    """
+    if (futures is None) == (periods is None):
+        raise ValueError('Pass exactly one of futures or periods.')
+    if seed is None:
+        seed = int(np.random.SeedSequence().entropy)
+        logger.info('predict_many: no seed given, using seed=%d', seed)
+    items = []
+    for sid, model in models.items():
+        future = (futures[sid] if futures is not None
+                  else model.make_future_dataframe(periods, freq=freq, include_history=include_history))
+        items.append((sid, model, future))
+
+    n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
+    if n_jobs == 1 or len(items) <= 1:
+        results = _predict_chunk(items, seed, history_uncertainty)
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+
+        n_chunks = min(len(items), n_jobs * 4)
+        chunks = [items[i::n_chunks] for i in range(n_chunks)]
+        ctx = multiprocessing.get_context('spawn')
+        with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx) as pool:
+            parts = pool.map(_predict_chunk, chunks, [seed] * n_chunks,
+                             [history_uncertainty] * n_chunks)
+            results = [r for part in parts for r in part]
+    forecasts = dict(results)
+    for fc in forecasts.values():
+        fc.attrs['seed'] = seed
+    return {sid: forecasts[sid] for sid in models}
