@@ -20,6 +20,7 @@ Only the sufficient statistics Zᵀ Z, Zᵀ y, yᵀ y and T are needed per serie
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 from collections import OrderedDict
 from copy import deepcopy
@@ -700,3 +701,39 @@ def _as_additive(inputs):
     """Inputs with every feature marked additive (for building the trend columns of Z)."""
     return dataclasses.replace(inputs, s_a=np.ones(len(np.asarray(inputs.s_a))),
                                s_m=np.zeros(len(np.asarray(inputs.s_m))))
+
+
+def _encode_id(series_id) -> bytes:
+    """Canonical, process-independent byte encoding of a series id."""
+    if isinstance(series_id, str):
+        return b's' + series_id.encode('utf-8')
+    if isinstance(series_id, bytes):
+        return b'b' + series_id
+    if isinstance(series_id, (bool, np.bool_)):
+        return b'?' + (b'1' if series_id else b'0')
+    if isinstance(series_id, (int, np.integer)):
+        return b'i' + str(int(series_id)).encode()
+    if isinstance(series_id, (float, np.floating)):
+        return b'f' + repr(float(series_id)).encode()
+    if isinstance(series_id, tuple):
+        parts = [_encode_id(x) for x in series_id]
+        return b't' + b''.join(len(p).to_bytes(4, 'big') + p for p in parts)
+    raise TypeError(
+        f'Series ids must be str, bytes, int, float, bool or tuples of these to get a '
+        f'reproducible random stream; got {type(series_id).__name__}.'
+    )
+
+
+def stable_id_hash(series_id) -> int:
+    """128-bit hash of a series id, identical across processes and Python runs
+    (unlike the built-in hash(), which is salted per process)."""
+    return int.from_bytes(hashlib.blake2b(_encode_id(series_id), digest_size=16).digest(), 'big')
+
+
+def series_rng(seed: int, series_id) -> np.random.Generator:
+    """Random generator for one series, determined only by (seed, series_id).
+
+    Independent of how many series there are, their order, and which process or batch
+    handles them, so parallel predictions are reproducible.
+    """
+    return np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(stable_id_hash(series_id),)))
