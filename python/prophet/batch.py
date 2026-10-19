@@ -64,10 +64,23 @@ def _feature_sign(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Solve min 0.5 wᵀHw − cᵀw + lam Σ_{j in l1} |w_j|, batched over series.
 
-    Feature-sign search (Lee et al., 2007). H: B × p × p, c: B × p, lam: B, l1: B × p.
-    Warm-started from w, act (active mask) and s (signs). Non-L1 coordinates are always
-    active. A new L1 coordinate is only added once the active coordinates are optimal,
-    which guarantees the objective decreases at every step.
+    Feature-sign search (Lee et al., 2007). Non-L1 coordinates are always active. A new
+    L1 coordinate is only added once the active coordinates are optimal, which
+    guarantees the objective decreases at every step.
+
+    Parameters
+    ----------
+    H: Quadratic term, B × p × p.
+    c: Linear term, B × p.
+    lam: L1 weight, B.
+    l1: True for L1 coordinates, B × p.
+    w, act, s: Warm start: coefficients, active mask and signs, B × p.
+    tol: Relative tolerance on the L1 optimality condition.
+    max_iter: Maximum number of steps.
+
+    Returns
+    -------
+    w, act, s at the solution, and the number of steps taken.
     """
     B, p = c.shape
     eye = np.eye(p)
@@ -141,6 +154,9 @@ def solve_map(
 ) -> tuple[np.ndarray, np.ndarray]:
     """MAP estimate from sufficient statistics, batched over B series.
 
+    Padding coordinates (unused by a series) should have G_jj = 1, C_j = 0,
+    ridge_j > 0 and l1_j = False; they solve to exactly 0.
+
     Parameters
     ----------
     G: Zᵀ Z, shape p × p (shared by all series) or B × p × p.
@@ -150,10 +166,9 @@ def solve_map(
     ridge: 1 / prior variance for each coordinate (0 for L1 coordinates), shape B × p.
     l1: True for coordinates with the Laplace prior (delta), shape B × p.
     tau: Laplace scale (changepoint_prior_scale), shape B.
-
-    Padding coordinates (unused by a series) should have G_jj = 1, C_j = 0,
-    ridge_j > 0 and l1_j = False; they solve to exactly 0.
-
+    tol: Relative change in sigma² at which a series has converged.
+    max_outer: Maximum number of sigma iterations.
+    max_inner: Maximum number of feature-sign steps per sigma iteration.
     w0, sigma0: Optional warm start (B × p, B). The active set and signs follow w0.
     stats: Optional dict; filled with 'outer' (sigma iterations) and 'inner' (total
         feature-sign steps).
@@ -213,8 +228,18 @@ def kkt_violation(
     l1: np.ndarray,
     tau: np.ndarray,
 ) -> np.ndarray:
-    """Largest violation of the optimality conditions for w (given sigma), per series,
-    in units of the L1 threshold 1 / tau. Zero at an exact optimum."""
+    """Largest violation of the optimality conditions for w (given sigma), per series.
+
+    Parameters
+    ----------
+    G, C, ridge, l1, tau: As in `solve_map`.
+    w: Coefficients, B × p.
+    sigma: sigma_obs, B.
+
+    Returns
+    -------
+    Violation per series in units of the L1 threshold 1 / tau; zero at an exact optimum.
+    """
     C = np.asarray(C, dtype=float)
     Gw = np.einsum('bpq,bq->bp', G, w) if G.ndim == 3 else w @ G
     g = (Gw - C) / sigma[:, None] ** 2 + ridge * w
@@ -232,6 +257,14 @@ def unsupported_reason(model: Prophet) -> str | None:
 
     Checks the configuration only. Whether every component is additive is known only
     after preprocessing; see `has_multiplicative_terms`.
+
+    Parameters
+    ----------
+    model: Unfitted Prophet object.
+
+    Returns
+    -------
+    A short reason, or None if the batched solver supports the model.
     """
     if model.history is not None:
         return 'model is already fitted'
@@ -246,7 +279,16 @@ def unsupported_reason(model: Prophet) -> str | None:
 
 
 def has_multiplicative_terms(model_inputs: ModelInputData) -> bool:
-    """True if any feature is multiplicative (then yhat is not linear in the parameters)."""
+    """True if any feature is multiplicative (then yhat is not linear in the parameters).
+
+    Parameters
+    ----------
+    model_inputs: Output of Prophet.preprocess.
+
+    Returns
+    -------
+    bool
+    """
     return bool(np.any(np.asarray(model_inputs.s_m) != 0))
 
 
@@ -256,6 +298,14 @@ def design_matrix(model_inputs: ModelInputData) -> np.ndarray:
     Valid for linear or flat growth with additive components only. For flat growth the
     trend is just m, so the k and delta columns are zero (they only feel their priors,
     and solve to exactly 0).
+
+    Parameters
+    ----------
+    model_inputs: Output of Prophet.preprocess.
+
+    Returns
+    -------
+    Z, shape T × (2 + S + K).
     """
     t = np.asarray(model_inputs.t, dtype=float)
     t_change = np.asarray(model_inputs.t_change, dtype=float)
@@ -304,8 +354,13 @@ def stack_problems(
 ]:
     """Stack per-series problems into padded batch arrays for `solve_map`.
 
-    problems: list of (Z, y, sigmas, tau), where Z comes from `design_matrix`.
-    Returns (layout, G, C, yy, T, ridge, l1, tau).
+    Parameters
+    ----------
+    problems: List of (Z, y, sigmas, tau), where Z comes from `design_matrix`.
+
+    Returns
+    -------
+    (layout, G, C, yy, T, ridge, l1, tau); see `solve_map` for the arrays.
     """
     S = [Z.shape[1] - 2 - len(sigmas) for Z, _, sigmas, _ in problems]
     K = [len(sigmas) for _, _, sigmas, _ in problems]
@@ -350,7 +405,18 @@ def log_posterior(
     l1: np.ndarray,
     tau: np.ndarray,
 ) -> np.ndarray:
-    """Log posterior per series, with the same constants dropped as Stan's lp__."""
+    """Log posterior per series, with the same constants dropped as Stan's lp__.
+
+    Parameters
+    ----------
+    G, C, yy, T, ridge, l1, tau: As in `solve_map`.
+    w: Coefficients, B × p.
+    sigma: sigma_obs, B.
+
+    Returns
+    -------
+    Log posterior, shape B.
+    """
     Gw = np.einsum('bpq,bq->bp', G, w) if G.ndim == 3 else w @ G
     rss = yy - 2 * np.einsum('bp,bp->b', C, w) + np.einsum('bp,bp->b', w, Gw)
     return (-0.5 * np.sum(ridge * w ** 2, axis=1)
@@ -368,7 +434,14 @@ def set_params(
     sigma_obs: float,
     lp: float,
 ) -> None:
-    """Store a MAP solution on a preprocessed model in the same form as Prophet.fit."""
+    """Store a MAP solution on a preprocessed model in the same form as Prophet.fit.
+
+    Parameters
+    ----------
+    model: Preprocessed Prophet object; its params and stan_fit are set.
+    k, m, delta, beta, sigma_obs: The MAP solution (scaled, as in Stan).
+    lp: Log posterior at the solution, stored as lp__.
+    """
     delta = np.asarray(delta, dtype=float)
     # Stan also returns the fitted (scaled) trend over the history, a transformed parameter.
     t = cast(pd.DataFrame, model.history)['t'].to_numpy(dtype=float)
@@ -393,7 +466,13 @@ def set_params(
 
 
 def set_constant_params(model: Prophet, num_regressors: int) -> None:
-    """Prophet.fit's rule for a constant history: initial params, sigma_obs = 1e-9."""
+    """Prophet.fit's rule for a constant history: initial params, sigma_obs = 1e-9.
+
+    Parameters
+    ----------
+    model: Preprocessed Prophet object; its params and stan_fit are set.
+    num_regressors: Number of features (K).
+    """
     params = dataclasses.asdict(model.calculate_initial_params(num_regressors))
     params['sigma_obs'] = 1e-9
     model.params = {k: np.array(v).reshape((1, -1)) for k, v in params.items()}
@@ -402,12 +481,13 @@ def set_constant_params(model: Prophet, num_regressors: int) -> None:
 
 
 def is_constant(model: Prophet) -> bool:
+    """True if the preprocessed model's history is constant."""
     y = cast(pd.DataFrame, model.history)['y']
     return bool(y.min() == y.max())
 
 
 def _fold_dummy_changepoint(model: Prophet) -> None:
-    # Same as Prophet.fit: with no changepoints, delta (for the dummy one at t=0) goes into k.
+    """Same as Prophet.fit: with no changepoints, delta (for the dummy one) goes into k."""
     if len(cast(pd.Series, model.changepoints)) == 0:
         model.params['k'] = model.params['k'] + model.params['delta'].reshape(-1)
         model.params['delta'] = np.zeros(model.params['delta'].shape).reshape((-1, 1))
@@ -416,7 +496,8 @@ def _fold_dummy_changepoint(model: Prophet) -> None:
 @dataclasses.dataclass
 class _SharedFeatures:
     """Date-only preprocessing results, reusable by models with the same configuration
-    and the same history dates."""
+    and the same history dates.
+    """
     X: Sequence[Sequence[float]] | pd.DataFrame  # seasonal features
     K: int
     sigmas: Sequence[float]
@@ -483,13 +564,16 @@ def _prepare(
     list[tuple[Hashable, Prophet]],
     list[tuple[Hashable, pd.DataFrame, str]],
 ]:
-    """Create and preprocess one model per series and sort them into batch / constant /
-    fallback. With share_dates, series with identical history dates reuse date-only work.
+    """Create and preprocess one model per series and sort them by how they are fit.
 
-    Returns (order, batch, mult, constant, fallback): batch is a list of (id, model, inputs, Z)
-    for purely additive models, mult a list of (id, model, inputs) for models with
-    multiplicative features, constant a list of (id, model), fallback a list of
-    (id, series df, reason).
+    With share_dates, series with identical history dates reuse date-only work.
+
+    Returns
+    -------
+    (order, batch, mult, constant, fallback): order lists the series ids; batch is a list
+    of (id, model, inputs, Z) for purely additive models, mult a list of (id, model,
+    inputs) for models with multiplicative features, constant a list of (id, model),
+    fallback a list of (id, series df, reason).
     """
     order, batch, mult, constant, fallback = [], [], [], [], []
     shared_by_dates = {}
@@ -553,6 +637,7 @@ def _fit_many_parallel(
     n_jobs: int,
     prophet_kwargs: dict[str, Any],
 ) -> dict[Hashable, Prophet]:
+    """fit_many with n_jobs > 1: fit contiguous chunks of series in a process pool."""
     if make_model is not None:
         try:
             pickle.dumps(make_model)
@@ -594,6 +679,18 @@ def fit_many(
 ) -> dict[Hashable, Prophet]:
     """Fit one Prophet model per series, solving all supported series together.
 
+    Series with linear or flat growth are fit by batched MAP solvers (no Stan): exactly
+    (a convex problem) when all components are additive, and to a stationary point
+    (hybrid alternating / Gauss-Newton) when some are multiplicative. Logistic growth,
+    MCMC and regressor predictors fall back to Prophet.fit (Stan), with exactly the same
+    result as calling it directly. The batched solution is the exact
+    optimum of the same posterior; it typically has a slightly higher log posterior than
+    Stan's L-BFGS, which stops early, so fitted values can differ slightly from fit().
+
+    Without make_model, all models share one configuration, so series with identical
+    history dates also share their date-only preprocessing (seasonality features and
+    design matrix); the resulting models are identical to individually preprocessed ones.
+
     Parameters
     ----------
     df: Long-format DataFrame with columns `id_col`, ds, y (and any regressor columns).
@@ -611,18 +708,6 @@ def fit_many(
     Returns
     -------
     Dict mapping each series id to its fitted Prophet model, in order of first appearance.
-
-    Series with linear or flat growth are fit by batched MAP solvers (no Stan): exactly
-    (a convex problem) when all components are additive, and to a stationary point
-    (hybrid alternating / Gauss-Newton) when some are multiplicative. Logistic growth,
-    MCMC and regressor predictors fall back to Prophet.fit (Stan), with exactly the same
-    result as calling it directly. The batched solution is the exact
-    optimum of the same posterior; it typically has a slightly higher log posterior than
-    Stan's L-BFGS, which stops early, so fitted values can differ slightly from fit().
-
-    Without make_model, all models share one configuration, so series with identical
-    history dates also share their date-only preprocessing (seasonality features and
-    design matrix); the resulting models are identical to individually preprocessed ones.
     """
     from prophet.forecaster import Prophet
 
@@ -706,6 +791,7 @@ def _multiplicative_log_posterior(
     ridge_m: np.ndarray,
     tau: np.ndarray,
 ) -> np.ndarray:
+    """Log posterior per series for `solve_map_multiplicative`; S is the delta mask."""
     trend = np.matmul(ZT, theta[:, :, None])[..., 0]
     yhat = (trend * (1 + np.matmul(Xm, bm[:, :, None])[..., 0])
             + np.matmul(Xa, ba[:, :, None])[..., 0])
@@ -748,12 +834,22 @@ def solve_map_multiplicative(
     tol=0 that is when a step no longer improves lp (lp never decreases), which gives
     KKT violations around 1e-9 in about 8 Gauss-Newton iterations.
 
-    Arrays are zero-padded to common sizes: ZT: B × T × (2 + S), Xa: B × T × Ka,
-    Xm: B × T × Km, y: B × T (padded rows all zero); T: true lengths (B);
-    delta_mask: B × S, True for real changepoints; ridge_a: B × Ka, ridge_m: B × Km
-    (1 / prior variance, positive on padding); tau: B.
+    Parameters
+    ----------
+    ZT, Xa, Xm, y: Zero-padded to common sizes: ZT: B × T × (2 + S), Xa: B × T × Ka,
+        Xm: B × T × Km, y: B × T (padded rows all zero).
+    T: True lengths, B.
+    delta_mask: True for real changepoints, B × S.
+    ridge_a, ridge_m: 1 / prior variance (positive on padding), B × Ka and B × Km.
+    tau: Laplace scale (changepoint_prior_scale), B.
+    tol: Relative change in lp at which a series stops.
+    max_iter: Maximum number of iterations.
+    method: 'hybrid', 'gauss-newton' or 'alternating' (see above).
+    switch_after: For 'hybrid', the number of alternating iterations before Gauss-Newton.
 
-    Returns theta (B × (2 + S)), beta_a, beta_m, sigma, lp, and the number of iterations.
+    Returns
+    -------
+    theta (B × (2 + S)), beta_a, beta_m, sigma, lp, and the number of iterations.
     """
     B, _, P = ZT.shape
     Ka, Km = Xa.shape[2], Xm.shape[2]
@@ -947,8 +1043,18 @@ def _encode_id(series_id: Hashable) -> bytes:
 
 
 def stable_id_hash(series_id: Hashable) -> int:
-    """128-bit hash of a series id, identical across processes and Python runs
-    (unlike the built-in hash(), which is salted per process)."""
+    """128-bit hash of a series id, identical across processes and Python runs.
+
+    Unlike the built-in hash(), which is salted per process.
+
+    Parameters
+    ----------
+    series_id: str, bytes, int, float, bool, or a tuple of these.
+
+    Returns
+    -------
+    Non-negative int below 2**128.
+    """
     return int.from_bytes(hashlib.blake2b(_encode_id(series_id), digest_size=16).digest(), 'big')
 
 
@@ -957,6 +1063,15 @@ def series_rng(seed: int, series_id: Hashable) -> np.random.Generator:
 
     Independent of how many series there are, their order, and which process or batch
     handles them, so parallel predictions are reproducible.
+
+    Parameters
+    ----------
+    seed: Integer seed shared by all series.
+    series_id: Series id, as accepted by `stable_id_hash`.
+
+    Returns
+    -------
+    np.random.Generator
     """
     return np.random.default_rng(
         np.random.SeedSequence(seed, spawn_key=(stable_id_hash(series_id),)))
