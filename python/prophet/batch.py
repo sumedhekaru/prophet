@@ -22,8 +22,12 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections import OrderedDict
+from copy import deepcopy
 
 import numpy as np
+import pandas as pd
+
+from prophet.models import ModelInputData, TrendIndicator
 
 logger = logging.getLogger('prophet.batch')
 
@@ -246,11 +250,14 @@ def stack_problems(problems):
     ridge = np.ones((B, p))  # padding slots get a positive ridge
     l1 = np.zeros((B, p), bool)
     tau = np.zeros(B)
+    gram_cache = {}  # series sharing one design matrix object share its Gram matrix
     for b, (Z, y, sigmas, tau_b) in enumerate(problems):
         idx = layout.index(b)
         y = np.asarray(y, dtype=float)
+        if id(Z) not in gram_cache:
+            gram_cache[id(Z)] = Z.T @ Z
         G[b] = np.eye(p)
-        G[b][np.ix_(idx, idx)] = Z.T @ Z
+        G[b][np.ix_(idx, idx)] = gram_cache[id(Z)]
         C[b, idx] = Z.T @ y
         yy[b] = y @ y
         T[b] = len(y)
@@ -316,6 +323,103 @@ def _fold_dummy_changepoint(model) -> None:
         model.params['delta'] = np.zeros(model.params['delta'].shape).reshape((-1, 1))
 
 
+@dataclasses.dataclass
+class _SharedFeatures:
+    """Date-only preprocessing results, reusable by models with the same configuration
+    and the same history dates."""
+    X: object               # seasonal features DataFrame
+    sigmas: list
+    component_cols: object  # DataFrame
+    modes: dict
+    train_holiday_names: object
+    Z: np.ndarray           # design matrix
+
+
+def _history_key(df) -> bytes:
+    """Identifies the history dates (rows with non-null y), in sorted order."""
+    ds = pd.to_datetime(df.loc[df['y'].notnull(), 'ds'])
+    return np.sort(ds.to_numpy(dtype='datetime64[ns]')).tobytes()
+
+
+def _preprocess_shared(model, df, shared: _SharedFeatures) -> ModelInputData:
+    """Same result as model.preprocess(df), reusing date-only features from `shared`.
+
+    Mirrors Prophet.preprocess step by step; only make_all_seasonality_features is
+    replaced by the shared result. The per-series steps use Prophet's own methods.
+    """
+    history = df[df['y'].notnull()].copy()
+    if history.shape[0] < 2:
+        raise ValueError('Dataframe has less than 2 non-NaN rows.')
+    model.history_dates = pd.to_datetime(pd.Series(df['ds'].unique(), name='ds')).sort_values()
+    model.history = model.setup_dataframe(history, initialize_scales=True)
+    model.set_auto_seasonalities()
+    model.train_component_cols = shared.component_cols.copy()
+    model.component_modes = deepcopy(shared.modes)
+    if shared.train_holiday_names is not None:
+        model.train_holiday_names = shared.train_holiday_names.copy()
+    model.fit_kwargs = {}
+    model.set_changepoints()
+    cap = np.zeros(model.history.shape[0])
+    return ModelInputData(
+        T=model.history.shape[0],
+        S=len(model.changepoints_t),
+        K=shared.X.shape[1],
+        tau=model.changepoint_prior_scale,
+        trend_indicator=TrendIndicator[model.growth.upper()].value,
+        y=model.history['y_scaled'],
+        t=model.history['t'],
+        t_change=model.changepoints_t,
+        X=shared.X,
+        sigmas=shared.sigmas,
+        s_a=shared.component_cols['additive_terms'],
+        s_m=shared.component_cols['multiplicative_terms'],
+        cap=cap,
+    )
+
+
+def _prepare(df, id_col, make_model, share_dates):
+    """Create and preprocess one model per series and sort them into batch / constant /
+    fallback. With share_dates, series with identical history dates reuse date-only work.
+
+    Returns (order, batch, constant, fallback): batch is a list of (id, model, inputs, Z),
+    constant a list of (id, model), fallback a list of (id, series df, reason).
+    """
+    order, batch, constant, fallback = [], [], [], []
+    shared_by_dates = {}
+    for sid, group in df.groupby(id_col, sort=False):
+        order.append(sid)
+        series_df = group.drop(columns=id_col).reset_index(drop=True)
+        model = make_model(sid)
+        reason = unsupported_reason(model)
+        if reason is not None:
+            fallback.append((sid, series_df, reason))
+            continue
+        shared = None
+        if share_dates:
+            key = _history_key(series_df)
+            shared = shared_by_dates.get(key)
+        if shared is None:
+            inputs = model.preprocess(series_df)
+            Z = None if has_multiplicative_terms(inputs) else design_matrix(inputs)
+            if share_dates:
+                shared_by_dates[key] = _SharedFeatures(
+                    X=inputs.X, sigmas=inputs.sigmas, component_cols=model.train_component_cols,
+                    modes=model.component_modes, train_holiday_names=model.train_holiday_names, Z=Z,
+                )
+        else:
+            inputs = _preprocess_shared(model, series_df, shared)
+            Z = shared.Z
+        if has_multiplicative_terms(inputs):
+            fallback.append((sid, series_df, 'multiplicative components'))
+            continue
+        if is_constant(model):
+            set_constant_params(model, inputs.K)
+            constant.append((sid, model))
+            continue
+        batch.append((sid, model, inputs, Z))
+    return order, batch, constant, fallback
+
+
 def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
     """Fit one Prophet model per series, solving all supported series together.
 
@@ -338,46 +442,29 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
     exactly the same result as calling it directly. The batched solution is the exact
     optimum of the same posterior; it typically has a slightly higher log posterior than
     Stan's L-BFGS, which stops early, so fitted values can differ slightly from fit().
+
+    Without make_model, all models share one configuration, so series with identical
+    history dates also share their date-only preprocessing (seasonality features and
+    design matrix); the resulting models are identical to individually preprocessed ones.
     """
     from prophet.forecaster import Prophet
 
+    share_dates = make_model is None
     if make_model is None:
         def make_model(series_id):
             return Prophet(**prophet_kwargs)
     elif prophet_kwargs:
         raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
 
-    order = []
-    models = {}
-    batch = []      # (id, model, inputs)
-    fallback = []   # (id, series df, reason)
-    n_constant = 0
-    for sid, group in df.groupby(id_col, sort=False):
-        order.append(sid)
-        series_df = group.drop(columns=id_col).reset_index(drop=True)
-        model = make_model(sid)
-        reason = unsupported_reason(model)
-        if reason is not None:
-            fallback.append((sid, series_df, reason))
-            continue
-        inputs = model.preprocess(series_df)
-        if has_multiplicative_terms(inputs):
-            fallback.append((sid, series_df, 'multiplicative components'))
-            continue
-        if is_constant(model):
-            set_constant_params(model, inputs.K)
-            models[sid] = model
-            n_constant += 1
-            continue
-        batch.append((sid, model, inputs))
+    order, batch, constant, fallback = _prepare(df, id_col, make_model, share_dates)
+    models = {sid: model for sid, model in constant}
 
     if batch:
-        problems = [(design_matrix(inputs), inputs.y, inputs.sigmas, inputs.tau)
-                    for _, _, inputs in batch]
+        problems = [(Z, inputs.y, inputs.sigmas, inputs.tau) for _, _, inputs, Z in batch]
         layout, G, C, yy, T, ridge, l1, tau = stack_problems(problems)
         w, sigma = solve_map(G, C, yy, T, ridge, l1, tau)
         lp = log_posterior(G, C, yy, T, w, sigma, ridge, l1, tau)
-        for b, (sid, model, _) in enumerate(batch):
+        for b, (sid, model, _, _) in enumerate(batch):
             k, m, delta, beta = layout.unpack(w[b], b)
             set_params(model, k, m, delta, beta, sigma[b], lp[b])
             models[sid] = model
@@ -388,6 +475,6 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
 
     logger.info(
         'fit_many: %d series batched, %d constant, %d fell back to Prophet.fit',
-        len(batch), n_constant, len(fallback),
+        len(batch), len(constant), len(fallback),
     )
     return {sid: models[sid] for sid in order}
