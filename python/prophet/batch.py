@@ -35,6 +35,8 @@ logger = logging.getLogger('prophet.batch')
 _KM_PRIOR_VAR = 25.0
 # Smallest sigma_obs; same as Prophet.fit's value for a constant history.
 _MIN_SIGMA = 1e-9
+# Series per multiplicative solve (each needs its full T × p design in memory).
+_MULT_CHUNK = 256
 
 
 def _feature_sign(H, c, lam, l1, w, act, s, tol, max_iter):
@@ -402,10 +404,12 @@ def _prepare(df, id_col, make_model, share_dates):
     """Create and preprocess one model per series and sort them into batch / constant /
     fallback. With share_dates, series with identical history dates reuse date-only work.
 
-    Returns (order, batch, constant, fallback): batch is a list of (id, model, inputs, Z),
-    constant a list of (id, model), fallback a list of (id, series df, reason).
+    Returns (order, batch, mult, constant, fallback): batch is a list of (id, model, inputs, Z)
+    for purely additive models, mult a list of (id, model, inputs) for models with
+    multiplicative features, constant a list of (id, model), fallback a list of
+    (id, series df, reason).
     """
-    order, batch, constant, fallback = [], [], [], []
+    order, batch, mult, constant, fallback = [], [], [], [], []
     shared_by_dates = {}
     for sid, group in df.groupby(id_col, sort=False):
         order.append(sid)
@@ -430,15 +434,14 @@ def _prepare(df, id_col, make_model, share_dates):
         else:
             inputs = _preprocess_shared(model, series_df, shared)
             Z = shared.Z
-        if has_multiplicative_terms(inputs):
-            fallback.append((sid, series_df, 'multiplicative components'))
-            continue
         if is_constant(model):
             set_constant_params(model, inputs.K)
             constant.append((sid, model))
-            continue
-        batch.append((sid, model, inputs, Z))
-    return order, batch, constant, fallback
+        elif has_multiplicative_terms(inputs):
+            mult.append((sid, model, inputs))
+        else:
+            batch.append((sid, model, inputs, Z))
+    return order, batch, mult, constant, fallback
 
 
 def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
@@ -458,9 +461,11 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
     -------
     Dict mapping each series id to its fitted Prophet model, in order of first appearance.
 
-    Series with linear growth and only additive components are fit by an exact batched
-    MAP solver (no Stan). Every other series falls back to Prophet.fit (Stan), with
-    exactly the same result as calling it directly. The batched solution is the exact
+    Series with linear or flat growth are fit by batched MAP solvers (no Stan): exactly
+    (a convex problem) when all components are additive, and to a stationary point
+    (hybrid alternating / Gauss-Newton) when some are multiplicative. Logistic growth,
+    MCMC and regressor predictors fall back to Prophet.fit (Stan), with exactly the same
+    result as calling it directly. The batched solution is the exact
     optimum of the same posterior; it typically has a slightly higher log posterior than
     Stan's L-BFGS, which stops early, so fitted values can differ slightly from fit().
 
@@ -477,7 +482,7 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
     elif prophet_kwargs:
         raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
 
-    order, batch, constant, fallback = _prepare(df, id_col, make_model, share_dates)
+    order, batch, mult, constant, fallback = _prepare(df, id_col, make_model, share_dates)
     models = {sid: model for sid, model in constant}
 
     if batch:
@@ -490,13 +495,25 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
             set_params(model, k, m, delta, beta, sigma[b], lp[b])
             models[sid] = model
 
+    # Multiplicative models: the design changes every iteration, so the solver needs each
+    # series' full data; chunks keep memory bounded.
+    for start in range(0, len(mult), _MULT_CHUNK):
+        chunk = mult[start:start + _MULT_CHUNK]
+        mb = _MultiplicativeBatch([inputs for _, _, inputs in chunk])
+        theta, ba, bm, sigma, lp, _ = mb.solve()
+        for b, (sid, model, _) in enumerate(chunk):
+            k, m, delta, beta = mb.unpack(b, theta, ba, bm)
+            set_params(model, k, m, delta, beta, sigma[b], lp[b])
+            models[sid] = model
+
     for sid, series_df, reason in fallback:
         logger.debug('Series %r falls back to Prophet.fit: %s', sid, reason)
         models[sid] = make_model(sid).fit(series_df)
 
     logger.info(
-        'fit_many: %d series batched, %d constant, %d fell back to Prophet.fit',
-        len(batch), len(constant), len(fallback),
+        'fit_many: %d series batched (%d additive, %d multiplicative), %d constant, '
+        '%d fell back to Prophet.fit',
+        len(batch) + len(mult), len(batch), len(mult), len(constant), len(fallback),
     )
     return {sid: models[sid] for sid in order}
 
