@@ -1460,7 +1460,12 @@ class Prophet:
 
         return self
 
-    def predict(self, df: pd.DataFrame | None = None, vectorized: bool = True) -> pd.DataFrame:
+    def predict(
+        self,
+        df: pd.DataFrame | None = None,
+        vectorized: bool = True,
+        history_uncertainty: bool = True,
+    ) -> pd.DataFrame:
         """Predict using the prophet model.
 
         Parameters
@@ -1471,6 +1476,11 @@ class Prophet:
         vectorized: Whether to use a vectorized method to compute uncertainty intervals. Suggest using
             True (the default) for much faster runtimes in most cases,
             except when (growth = 'logistic' and mcmc_samples > 0).
+        history_uncertainty: Whether to compute yhat/trend uncertainty intervals for rows
+            within the history (ds up to the last training date). True (the default)
+            computes them for every row. False leaves them NaN for history rows and only
+            samples the future rows, which is much faster when the history is included;
+            the future intervals are then exactly those of predicting the future rows alone.
 
         Returns
         -------
@@ -1501,7 +1511,10 @@ class Prophet:
         df['trend'] = self.predict_trend(df)
         seasonal_components = self.predict_seasonal_components(df)
         if self.uncertainty_samples:
-            intervals = self.predict_uncertainty(df, vectorized, regressor_samples)
+            if history_uncertainty:
+                intervals = self.predict_uncertainty(df, vectorized, regressor_samples)
+            else:
+                intervals = self._future_uncertainty(df, vectorized, regressor_samples)
         else:
             intervals = None
 
@@ -1708,6 +1721,25 @@ class Prophet:
                 sim_values[key], upper_p, axis=1)
 
         return pd.DataFrame(series)
+
+    def _future_uncertainty(
+        self,
+        df: pd.DataFrame,
+        vectorized: bool,
+        regressor_samples: dict[str, npt.NDArray[np.float64]] | None = None,
+    ) -> pd.DataFrame:
+        """predict_uncertainty for future rows (t > 1) only; NaN for history rows."""
+        future = (df['t'] > 1).to_numpy()
+        columns = ['yhat_lower', 'yhat_upper', 'trend_lower', 'trend_upper']
+        intervals = pd.DataFrame(np.nan, index=df.index, columns=columns)
+        if future.any():
+            future_samples = None
+            if regressor_samples:
+                future_samples = {k: v[future] for k, v in regressor_samples.items()}
+            future_intervals = self.predict_uncertainty(
+                df.loc[future].reset_index(drop=True), vectorized, future_samples)
+            intervals.loc[future, columns] = future_intervals[columns].to_numpy()
+        return intervals
 
     def sample_posterior_predictive(
         self,
