@@ -1703,8 +1703,13 @@ class Prophet:
         series = {}
         for key in ['yhat', 'trend']:
             # Both bounds in one call: a single partition pass over the samples.
-            lower, upper = self.percentile(
-                sim_values[key], [lower_p, upper_p], axis=1)
+            if key == 'trend':
+                # Historical trend has no sampled uncertainty under MAP.
+                lower, upper = self._percentile_skip_constant_rows(
+                    sim_values[key], [lower_p, upper_p])
+            else:
+                lower, upper = self.percentile(
+                    sim_values[key], [lower_p, upper_p], axis=1)
             series['{}_lower'.format(key)] = lower
             series['{}_upper'.format(key)] = upper
 
@@ -2184,6 +2189,20 @@ class Prophet:
         """
         fn = np.nanpercentile if np.isnan(a).any() else np.percentile
         return fn(a, *args, **kwargs)
+
+    def _percentile_skip_constant_rows(self, a: np.ndarray, q: list[float]) -> np.ndarray:
+        """Percentiles along axis 1, shape (len(q), len(a)).
+
+        Rows where every sample is equal have that value as every percentile,
+        so only the remaining rows are partitioned. Rows with NaNs are never
+        treated as constant.
+        """
+        constant = (a == a[:, :1]).all(axis=1)
+        out = np.repeat(a[:, :1].T, len(q), axis=0)
+        varying = ~constant
+        if varying.any():
+            out[:, varying] = self.percentile(a[varying], q, axis=1)
+        return out
 
     def make_future_dataframe(
         self, periods: int, freq: str | None = 'D', include_history: bool = True
