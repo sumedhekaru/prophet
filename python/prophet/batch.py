@@ -499,3 +499,187 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
         len(batch), len(constant), len(fallback),
     )
     return {sid: models[sid] for sid in order}
+
+
+def _gram(Z, y):
+    """Batched Zᵀ Z, Zᵀ y, yᵀ y for Z: B × T × p, y: B × T."""
+    G = np.matmul(Z.transpose(0, 2, 1), Z)
+    C = np.matmul(Z.transpose(0, 2, 1), y[:, :, None])[..., 0]
+    return G, C, np.einsum('bt,bt->b', y, y)
+
+
+def _multiplicative_log_posterior(ZT, Xa, Xm, y, T, theta, ba, bm, sigma, S, ridge_a, ridge_m, tau):
+    trend = np.matmul(ZT, theta[:, :, None])[..., 0]
+    yhat = (trend * (1 + np.matmul(Xm, bm[:, :, None])[..., 0])
+            + np.matmul(Xa, ba[:, :, None])[..., 0])
+    rss = np.sum((y - yhat) ** 2, axis=1)
+    delta = theta[:, 2:]
+    return (-(theta[:, 0] ** 2 + theta[:, 1] ** 2) / (2 * _KM_PRIOR_VAR)
+            - np.sum(np.abs(delta) * S, axis=1) / tau
+            - 0.5 * np.sum(ridge_a * ba ** 2, axis=1) - 0.5 * np.sum(ridge_m * bm ** 2, axis=1)
+            - sigma ** 2 / (2 * 0.5 ** 2) - T * np.log(sigma) - rss / (2 * sigma ** 2))
+
+
+def solve_map_multiplicative(ZT, Xa, Xm, y, T, delta_mask, ridge_a, ridge_m, tau,
+                             tol=0.0, max_iter=100, method='hybrid', switch_after=10):
+    """MAP for models with multiplicative features.
+
+        yhat = (ZT θ) ∘ (1 + Xm β_m) + Xa β_a,   θ = [k, m, δ]
+
+    method='hybrid' (default): `switch_after` alternating iterations (cheap; most series
+    converge there), then Gauss-Newton for the rest.
+    method='gauss-newton': each iteration linearizes yhat in all parameters at
+    the current point, solves the resulting lasso subproblem exactly with `solve_map`
+    (warm-started), and backtracks along the step until the true log posterior does not
+    decrease. method='alternating': exact block solves, (θ, β_a) given β_m, then
+    (β_m, β_a) given θ; also monotone, but can zig-zag for hundreds of iterations.
+    The joint problem is non-convex (bilinear), so the result is a stationary point.
+    Stops per series when lp changes by no more than `tol` (relative). With the default
+    tol=0 that is when a step no longer improves lp (lp never decreases), which gives
+    KKT violations around 1e-9 in about 8 Gauss-Newton iterations.
+
+    Arrays are zero-padded to common sizes: ZT: B × T × (2 + S), Xa: B × T × Ka,
+    Xm: B × T × Km, y: B × T (padded rows all zero); T: true lengths (B);
+    delta_mask: B × S, True for real changepoints; ridge_a: B × Ka, ridge_m: B × Km
+    (1 / prior variance, positive on padding); tau: B.
+
+    Returns theta (B × (2 + S)), beta_a, beta_m, sigma, lp, and the number of iterations.
+    """
+    B, _, P = ZT.shape
+    Ka, Km = Xa.shape[2], Xm.shape[2]
+    ridge_T = np.concatenate([np.full((B, 2), 1 / _KM_PRIOR_VAR), np.where(delta_mask, 0.0, 1.0)], axis=1)
+    l1_T = np.concatenate([np.zeros((B, 2), bool), delta_mask], axis=1)
+    ridge_J = np.concatenate([ridge_T, ridge_a, ridge_m], axis=1)
+    l1_J = np.concatenate([l1_T, np.zeros((B, Ka + Km), bool)], axis=1)
+
+    theta = np.zeros((B, P))
+    ba = np.zeros((B, Ka))
+    bm = np.zeros((B, Km))
+    sigma = np.ones(B)
+    args = (ZT, Xa, Xm, y, T)
+
+    def lp_at(L, th, a, m, sg):
+        return _multiplicative_log_posterior(
+            ZT[L], Xa[L], Xm[L], y[L], T[L], th, a, m, sg, delta_mask[L],
+            ridge_a[L], ridge_m[L], tau[L])
+
+    lp = np.full(B, -np.inf)
+    live = np.arange(B)
+    it = 0
+    for it in range(1, max_iter + 1):
+        L = live
+        if method == 'alternating' or (method == 'hybrid' and it <= switch_after):
+            wgt = 1 + np.matmul(Xm[L], bm[L][:, :, None])[..., 0]
+            ZA = np.concatenate([wgt[:, :, None] * ZT[L], Xa[L]], axis=2)
+            G, C, yy = _gram(ZA, y[L])
+            wA, sigma[L] = solve_map(G, C, yy, T[L], np.concatenate([ridge_T[L], ridge_a[L]], axis=1),
+                                     np.concatenate([l1_T[L], np.zeros((len(L), Ka), bool)], axis=1),
+                                     tau[L], w0=np.concatenate([theta[L], ba[L]], axis=1), sigma0=sigma[L])
+            theta[L], ba[L] = wA[:, :P], wA[:, P:]
+            trend = np.matmul(ZT[L], theta[L][:, :, None])[..., 0]
+            ZB = np.concatenate([trend[:, :, None] * Xm[L], Xa[L]], axis=2)
+            G, C, yy = _gram(ZB, y[L] - trend)
+            wB, sigma[L] = solve_map(G, C, yy, T[L], np.concatenate([ridge_m[L], ridge_a[L]], axis=1),
+                                     np.zeros((len(L), Km + Ka), bool), tau[L],
+                                     w0=np.concatenate([bm[L], ba[L]], axis=1), sigma0=sigma[L])
+            bm[L], ba[L] = wB[:, :Km], wB[:, Km:]
+            lp_new = lp_at(L, theta[L], ba[L], bm[L], sigma[L])
+        else:
+            # Linearize yhat around p = [θ, β_a, β_m]: yhat(p') ≈ yhat(p) + J (p' − p).
+            trend = np.matmul(ZT[L], theta[L][:, :, None])[..., 0]
+            mult = 1 + np.matmul(Xm[L], bm[L][:, :, None])[..., 0]
+            J = np.concatenate([mult[:, :, None] * ZT[L], Xa[L], trend[:, :, None] * Xm[L]], axis=2)
+            p_cur = np.concatenate([theta[L], ba[L], bm[L]], axis=1)
+            yhat = trend * mult + np.matmul(Xa[L], ba[L][:, :, None])[..., 0]
+            y_lin = y[L] - yhat + np.matmul(J, p_cur[:, :, None])[..., 0]
+            G, C, yy = _gram(J, y_lin)
+            p_new, _ = solve_map(G, C, yy, T[L], ridge_J[L], l1_J[L], tau[L], w0=p_cur, sigma0=sigma[L])
+            # Backtrack until the true log posterior doesn't decrease; sigma is set to its
+            # closed-form optimum at each trial point.
+            step = np.ones(len(L))
+            lp_cur = lp[L] if it > 1 else np.full(len(L), -np.inf)
+            accepted = np.zeros(len(L), bool)
+            p_acc, s_acc, lp_acc = p_cur.copy(), sigma[L].copy(), lp_cur.copy()
+            for _ in range(30):
+                trial = p_cur + step[:, None] * (p_new - p_cur)
+                th, a, m = trial[:, :P], trial[:, P:P + Ka], trial[:, P + Ka:]
+                tr = np.matmul(ZT[L], th[:, :, None])[..., 0]
+                yh = tr * (1 + np.matmul(Xm[L], m[:, :, None])[..., 0]) + np.matmul(Xa[L], a[:, :, None])[..., 0]
+                rss = np.sum((y[L] - yh) ** 2, axis=1)
+                sg = np.sqrt(np.maximum((-T[L] + np.sqrt(T[L] ** 2 + 16 * rss)) / 8, _MIN_SIGMA ** 2))
+                lp_try = lp_at(L, th, a, m, sg)
+                ok = ~accepted & (lp_try >= lp_cur)
+                p_acc[ok], s_acc[ok], lp_acc[ok] = trial[ok], sg[ok], lp_try[ok]
+                accepted |= ok
+                if accepted.all():
+                    break
+                step = np.where(accepted, step, step / 2)
+            theta[L], ba[L], bm[L] = p_acc[:, :P], p_acc[:, P:P + Ka], p_acc[:, P + Ka:]
+            sigma[L] = s_acc
+            lp_new = lp_acc
+        done = np.abs(lp_new - lp[L]) <= tol * np.abs(lp_new)
+        lp[L] = lp_new
+        live = L[~done]
+        if live.size == 0:
+            break
+    return theta, ba, bm, sigma, lp, it
+
+
+class _MultiplicativeBatch:
+    """Zero-padded arrays for `solve_map_multiplicative`, built from model inputs."""
+
+    def __init__(self, inputs_list):
+        B = len(inputs_list)
+        parts = []
+        for inputs in inputs_list:
+            Z = design_matrix(_as_additive(inputs))  # trend columns are what we need here
+            S = len(np.atleast_1d(inputs.t_change))
+            X = np.asarray(inputs.X, dtype=float)
+            s_m = np.asarray(inputs.s_m, dtype=float) != 0
+            sig = np.asarray(inputs.sigmas, dtype=float)
+            parts.append(dict(ZT=Z[:, :2 + S], Xa=X[:, ~s_m], Xm=X[:, s_m], y=np.asarray(inputs.y, float),
+                              ia=np.flatnonzero(~s_m), im=np.flatnonzero(s_m), sig=sig, S=S,
+                              K=len(sig), tau=float(inputs.tau)))
+        self.parts = parts
+        Tm = max(len(p['y']) for p in parts)
+        Sm = max(p['S'] for p in parts)
+        Ka = max(p['Xa'].shape[1] for p in parts)
+        Km = max(p['Xm'].shape[1] for p in parts)
+        self.ZT = np.zeros((B, Tm, 2 + Sm))
+        self.Xa = np.zeros((B, Tm, Ka))
+        self.Xm = np.zeros((B, Tm, Km))
+        self.y = np.zeros((B, Tm))
+        self.T = np.zeros(B)
+        self.delta_mask = np.zeros((B, Sm), bool)
+        self.ridge_a = np.ones((B, Ka))
+        self.ridge_m = np.ones((B, Km))
+        self.tau = np.zeros(B)
+        for b, p in enumerate(parts):
+            T, S = len(p['y']), p['S']
+            self.ZT[b, :T, :2 + S] = p['ZT']
+            self.Xa[b, :T, :p['Xa'].shape[1]] = p['Xa']
+            self.Xm[b, :T, :p['Xm'].shape[1]] = p['Xm']
+            self.y[b, :T] = p['y']
+            self.T[b] = T
+            self.delta_mask[b, :S] = True
+            self.ridge_a[b, :len(p['ia'])] = 1 / p['sig'][p['ia']] ** 2
+            self.ridge_m[b, :len(p['im'])] = 1 / p['sig'][p['im']] ** 2
+            self.tau[b] = p['tau']
+
+    def solve(self, **kw):
+        return solve_map_multiplicative(self.ZT, self.Xa, self.Xm, self.y, self.T, self.delta_mask,
+                                        self.ridge_a, self.ridge_m, self.tau, **kw)
+
+    def unpack(self, b, theta, ba, bm):
+        """(k, m, delta, beta) for series b, with beta in the model's feature order."""
+        p = self.parts[b]
+        beta = np.zeros(p['K'])
+        beta[p['ia']] = ba[b, :len(p['ia'])]
+        beta[p['im']] = bm[b, :len(p['im'])]
+        return float(theta[b, 0]), float(theta[b, 1]), theta[b, 2:2 + p['S']].copy(), beta
+
+
+def _as_additive(inputs):
+    """Inputs with every feature marked additive (for building the trend columns of Z)."""
+    return dataclasses.replace(inputs, s_a=np.ones(len(np.asarray(inputs.s_a))),
+                               s_m=np.zeros(len(np.asarray(inputs.s_m))))
