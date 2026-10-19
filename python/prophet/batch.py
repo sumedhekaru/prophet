@@ -179,3 +179,76 @@ def unsupported_reason(model) -> str | None:
 def has_multiplicative_terms(model_inputs) -> bool:
     """True if any feature is multiplicative (then yhat is not linear in the parameters)."""
     return bool(np.any(np.asarray(model_inputs.s_m) != 0))
+
+
+def design_matrix(model_inputs) -> np.ndarray:
+    """Z such that the fitted values (scaled) are Z @ [k, m, delta, beta].
+
+    Valid for linear growth with additive components only.
+    """
+    t = np.asarray(model_inputs.t, dtype=float)
+    t_change = np.asarray(model_inputs.t_change, dtype=float)
+    X = np.asarray(model_inputs.X, dtype=float) * np.asarray(model_inputs.s_a, dtype=float)
+    hinge = (t[:, None] >= t_change[None, :]) * (t[:, None] - t_change[None, :])
+    return np.column_stack([t, np.ones_like(t), hinge, X])
+
+
+class _Layout:
+    """Common coordinate layout for a batch: [k, m, delta (S_max), beta (K_max)].
+
+    Each series uses the first S_b delta slots and the first K_b beta slots; unused
+    slots are padding that solves to exactly 0.
+    """
+
+    def __init__(self, S: list[int], K: list[int]):
+        self.S = np.asarray(S)
+        self.K = np.asarray(K)
+        self.S_max = int(self.S.max())
+        self.K_max = int(self.K.max())
+        self.p = 2 + self.S_max + self.K_max
+
+    def index(self, b: int) -> np.ndarray:
+        """Layout positions of series b's own coordinates, in its natural order."""
+        S, K = self.S[b], self.K[b]
+        return np.concatenate([[0, 1], 2 + np.arange(S), 2 + self.S_max + np.arange(K)])
+
+    def unpack(self, w_b: np.ndarray, b: int) -> tuple[float, float, np.ndarray, np.ndarray]:
+        """(k, m, delta, beta) for series b from its row of the batch solution."""
+        S, K = self.S[b], self.K[b]
+        return (float(w_b[0]), float(w_b[1]), w_b[2:2 + S].copy(),
+                w_b[2 + self.S_max:2 + self.S_max + K].copy())
+
+
+def stack_problems(problems):
+    """Stack per-series problems into padded batch arrays for `solve_map`.
+
+    problems: list of (Z, y, sigmas, tau), where Z comes from `design_matrix`.
+    Returns (layout, G, C, yy, T, ridge, l1, tau).
+    """
+    S = [Z.shape[1] - 2 - len(sigmas) for Z, _, sigmas, _ in problems]
+    K = [len(sigmas) for _, _, sigmas, _ in problems]
+    layout = _Layout(S, K)
+    B, p = len(problems), layout.p
+    G = np.zeros((B, p, p))
+    C = np.zeros((B, p))
+    yy = np.zeros(B)
+    T = np.zeros(B)
+    ridge = np.ones((B, p))  # padding slots get a positive ridge
+    l1 = np.zeros((B, p), bool)
+    tau = np.zeros(B)
+    for b, (Z, y, sigmas, tau_b) in enumerate(problems):
+        idx = layout.index(b)
+        y = np.asarray(y, dtype=float)
+        G[b] = np.eye(p)
+        G[b][np.ix_(idx, idx)] = Z.T @ Z
+        C[b, idx] = Z.T @ y
+        yy[b] = y @ y
+        T[b] = len(y)
+        S_b = layout.S[b]
+        ridge[b, idx] = np.concatenate([
+            [1 / _KM_PRIOR_VAR, 1 / _KM_PRIOR_VAR], np.zeros(S_b),
+            1 / np.asarray(sigmas, dtype=float) ** 2,
+        ])
+        l1[b, idx[2:2 + S_b]] = True
+        tau[b] = tau_b
+    return layout, G, C, yy, T, ridge, l1, tau
