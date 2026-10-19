@@ -23,6 +23,7 @@ import dataclasses
 import hashlib
 import logging
 import os
+import pickle
 from collections import OrderedDict
 from copy import deepcopy
 
@@ -446,7 +447,55 @@ def _prepare(df, id_col, make_model, share_dates):
     return order, batch, mult, constant, fallback
 
 
-def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
+def _group_by(items, key):
+    """Group items by key, keeping first-appearance order of groups and items."""
+    groups = {}
+    for item in items:
+        groups.setdefault(key(item), []).append(item)
+    return list(groups.values())
+
+
+def _fit_chunk(chunk_df, id_col, make_model, prophet_kwargs):
+    """Worker for fit_many(n_jobs > 1): fit one chunk of series in this process."""
+    if make_model is None:
+        return fit_many(chunk_df, id_col=id_col, **prophet_kwargs)
+    return fit_many(chunk_df, id_col=id_col, make_model=make_model)
+
+
+def _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs):
+    if make_model is not None:
+        try:
+            pickle.dumps(make_model)
+        except Exception as e:
+            raise ValueError(
+                'With n_jobs != 1, make_model must be picklable (a module-level function, '
+                'not a lambda or closure).'
+            ) from e
+    rows_by_id = df.groupby(id_col, sort=False).indices
+    ids = list(rows_by_id)
+    n_chunks = min(len(ids), n_jobs * 2)
+    bounds = np.linspace(0, len(ids), n_chunks + 1).astype(int)
+    chunks = []
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        rows = np.concatenate([rows_by_id[sid] for sid in ids[lo:hi]])
+        chunks.append(df.iloc[np.sort(rows)])
+
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    ctx = multiprocessing.get_context('spawn')
+    with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx) as pool:
+        parts = list(pool.map(_fit_chunk, chunks, [id_col] * len(chunks),
+                              [make_model] * len(chunks), [prophet_kwargs] * len(chunks)))
+    models = {}
+    for part in parts:
+        models.update(part)
+    logger.info('fit_many: %d series in %d chunks on %d worker processes',
+                len(ids), len(chunks), n_jobs)
+    return {sid: models[sid] for sid in ids}
+
+
+def fit_many(df, id_col='unique_id', make_model=None, n_jobs=1, **prophet_kwargs):
     """Fit one Prophet model per series, solving all supported series together.
 
     Parameters
@@ -457,6 +506,10 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
         configured Prophet for that series (for holidays, extra regressors, custom
         seasonalities). It must return a fresh object on every call; it may be called
         more than once per series. Defaults to `Prophet(**prophet_kwargs)`.
+    n_jobs: Number of worker processes; 1 (default) runs in this process, -1 uses all
+        CPUs. The series are split into contiguous chunks, each fit like n_jobs=1, so
+        results are bit-identical for any n_jobs. With n_jobs != 1, make_model must be
+        picklable (a module-level function, not a lambda or closure).
     prophet_kwargs: Passed to Prophet() when make_model is not given.
 
     Returns
@@ -477,6 +530,12 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
     """
     from prophet.forecaster import Prophet
 
+    if make_model is not None and prophet_kwargs:
+        raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
+    n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
+    if n_jobs > 1:
+        return _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs)
+
     share_dates = make_model is None
     if make_model is None:
         def make_model(series_id):
@@ -487,26 +546,35 @@ def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
     order, batch, mult, constant, fallback = _prepare(df, id_col, make_model, share_dates)
     models = {sid: model for sid, model in constant}
 
-    if batch:
-        problems = [(Z, inputs.y, inputs.sigmas, inputs.tau) for _, _, inputs, Z in batch]
+    # Series are solved in groups of identical coordinate shape, so no series is padded
+    # to another's size. Each series' arithmetic then depends only on its own data,
+    # which makes results bit-identical however the series are batched (and so for any
+    # n_jobs). Padding time rows with zeros is exact and needs no grouping.
+    for group in _group_by(batch, lambda item: (len(item[2].t_change), item[2].X.shape[1])):
+        problems = [(Z, inputs.y, inputs.sigmas, inputs.tau) for _, _, inputs, Z in group]
         layout, G, C, yy, T, ridge, l1, tau = stack_problems(problems)
         w, sigma = solve_map(G, C, yy, T, ridge, l1, tau)
         lp = log_posterior(G, C, yy, T, w, sigma, ridge, l1, tau)
-        for b, (sid, model, _, _) in enumerate(batch):
+        for b, (sid, model, _, _) in enumerate(group):
             k, m, delta, beta = layout.unpack(w[b], b)
             set_params(model, k, m, delta, beta, sigma[b], lp[b])
             models[sid] = model
 
     # Multiplicative models: the design changes every iteration, so the solver needs each
     # series' full data; chunks keep memory bounded.
-    for start in range(0, len(mult), _MULT_CHUNK):
-        chunk = mult[start:start + _MULT_CHUNK]
-        mb = _MultiplicativeBatch([inputs for _, _, inputs in chunk])
-        theta, ba, bm, sigma, lp, _ = mb.solve()
-        for b, (sid, model, _) in enumerate(chunk):
-            k, m, delta, beta = mb.unpack(b, theta, ba, bm)
-            set_params(model, k, m, delta, beta, sigma[b], lp[b])
-            models[sid] = model
+    def mult_shape(item):
+        s_m = np.asarray(item[2].s_m) != 0
+        return len(np.atleast_1d(item[2].t_change)), int((~s_m).sum()), int(s_m.sum())
+
+    for group in _group_by(mult, mult_shape):
+        for start in range(0, len(group), _MULT_CHUNK):
+            chunk = group[start:start + _MULT_CHUNK]
+            mb = _MultiplicativeBatch([inputs for _, _, inputs in chunk])
+            theta, ba, bm, sigma, lp, _ = mb.solve()
+            for b, (sid, model, _) in enumerate(chunk):
+                k, m, delta, beta = mb.unpack(b, theta, ba, bm)
+                set_params(model, k, m, delta, beta, sigma[b], lp[b])
+                models[sid] = model
 
     for sid, series_df, reason in fallback:
         logger.debug('Series %r falls back to Prophet.fit: %s', sid, reason)
