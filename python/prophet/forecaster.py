@@ -1695,10 +1695,11 @@ class Prophet:
 
         series = {}
         for key in ['yhat', 'trend']:
-            series['{}_lower'.format(key)] = self.percentile(
-                sim_values[key], lower_p, axis=1)
-            series['{}_upper'.format(key)] = self.percentile(
-                sim_values[key], upper_p, axis=1)
+            # Both bounds in one call: a single partition pass over the samples.
+            lower, upper = self.percentile(
+                sim_values[key], [lower_p, upper_p], axis=1)
+            series['{}_lower'.format(key)] = lower
+            series['{}_upper'.format(key)] = upper
 
         return pd.DataFrame(series)
 
