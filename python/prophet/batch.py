@@ -20,9 +20,12 @@ Only the sufficient statistics Zᵀ Z, Zᵀ y, yᵀ y and T are needed per serie
 from __future__ import annotations
 
 import dataclasses
+import logging
 from collections import OrderedDict
 
 import numpy as np
+
+logger = logging.getLogger('prophet.batch')
 
 # Prior scales fixed in prophet.stan: k, m ~ normal(0, 5); sigma_obs ~ normal(0, 0.5).
 _KM_PRIOR_VAR = 25.0
@@ -307,3 +310,80 @@ def _fold_dummy_changepoint(model) -> None:
     if len(model.changepoints) == 0:
         model.params['k'] = model.params['k'] + model.params['delta'].reshape(-1)
         model.params['delta'] = np.zeros(model.params['delta'].shape).reshape((-1, 1))
+
+
+def fit_many(df, id_col='unique_id', make_model=None, **prophet_kwargs):
+    """Fit one Prophet model per series, solving all supported series together.
+
+    Parameters
+    ----------
+    df: Long-format DataFrame with columns `id_col`, ds, y (and any regressor columns).
+    id_col: Column identifying the series.
+    make_model: Optional callable `make_model(series_id)` returning a new, unfitted,
+        configured Prophet for that series (for holidays, extra regressors, custom
+        seasonalities). It must return a fresh object on every call; it may be called
+        more than once per series. Defaults to `Prophet(**prophet_kwargs)`.
+    prophet_kwargs: Passed to Prophet() when make_model is not given.
+
+    Returns
+    -------
+    Dict mapping each series id to its fitted Prophet model, in order of first appearance.
+
+    Series with linear growth and only additive components are fit by an exact batched
+    MAP solver (no Stan). Every other series falls back to Prophet.fit (Stan), with
+    exactly the same result as calling it directly. The batched solution is the exact
+    optimum of the same posterior; it typically has a slightly higher log posterior than
+    Stan's L-BFGS, which stops early, so fitted values can differ slightly from fit().
+    """
+    from prophet.forecaster import Prophet
+
+    if make_model is None:
+        def make_model(series_id):
+            return Prophet(**prophet_kwargs)
+    elif prophet_kwargs:
+        raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
+
+    order = []
+    models = {}
+    batch = []      # (id, model, inputs)
+    fallback = []   # (id, series df, reason)
+    n_constant = 0
+    for sid, group in df.groupby(id_col, sort=False):
+        order.append(sid)
+        series_df = group.drop(columns=id_col).reset_index(drop=True)
+        model = make_model(sid)
+        reason = unsupported_reason(model)
+        if reason is not None:
+            fallback.append((sid, series_df, reason))
+            continue
+        inputs = model.preprocess(series_df)
+        if has_multiplicative_terms(inputs):
+            fallback.append((sid, series_df, 'multiplicative components'))
+            continue
+        if is_constant(model):
+            set_constant_params(model, inputs.K)
+            models[sid] = model
+            n_constant += 1
+            continue
+        batch.append((sid, model, inputs))
+
+    if batch:
+        problems = [(design_matrix(inputs), inputs.y, inputs.sigmas, inputs.tau)
+                    for _, _, inputs in batch]
+        layout, G, C, yy, T, ridge, l1, tau = stack_problems(problems)
+        w, sigma = solve_map(G, C, yy, T, ridge, l1, tau)
+        lp = log_posterior(G, C, yy, T, w, sigma, ridge, l1, tau)
+        for b, (sid, model, _) in enumerate(batch):
+            k, m, delta, beta = layout.unpack(w[b], b)
+            set_params(model, k, m, delta, beta, sigma[b], lp[b])
+            models[sid] = model
+
+    for sid, series_df, reason in fallback:
+        logger.debug('Series %r falls back to Prophet.fit: %s', sid, reason)
+        models[sid] = make_model(sid).fit(series_df)
+
+    logger.info(
+        'fit_many: %d series batched, %d constant, %d fell back to Prophet.fit',
+        len(batch), n_constant, len(fallback),
+    )
+    return {sid: models[sid] for sid in order}
