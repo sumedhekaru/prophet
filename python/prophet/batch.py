@@ -50,7 +50,8 @@ def _feature_sign(H, c, lam, l1, w, act, s, tol, max_iter):
     rows = np.arange(B)
     done = np.zeros(B, bool)
     need_step = np.ones(B, bool)
-    for _ in range(max_iter):
+    steps = 0
+    for steps in range(1, max_iter + 1):
         g = np.einsum("bij,bj->bi", H, w) - c
         viol = l1 & ~act & (np.abs(g) > lam[:, None] * (1 + tol))
         ready = ~need_step & ~done
@@ -96,10 +97,11 @@ def _feature_sign(H, c, lam, l1, w, act, s, tol, max_iter):
         act = act & ~(l1 & (w == 0))
         s = np.where(l1 & act, np.sign(w), 0.0)
         need_step = need_step & ~(stepping & (t >= 1.0))
-    return w, act, s
+    return w, act, s, steps
 
 
-def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=500):
+def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=500,
+              w0=None, sigma0=None, stats=None):
     """MAP estimate from sufficient statistics, batched over B series.
 
     Parameters
@@ -115,6 +117,10 @@ def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=5
     Padding coordinates (unused by a series) should have G_jj = 1, C_j = 0,
     ridge_j > 0 and l1_j = False; they solve to exactly 0.
 
+    w0, sigma0: Optional warm start (B × p, B). The active set and signs follow w0.
+    stats: Optional dict; filled with 'outer' (sigma iterations) and 'inner' (total
+        feature-sign steps).
+
     Returns
     -------
     w (B × p) and sigma_obs (B).
@@ -126,21 +132,23 @@ def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=5
     ridge = np.asarray(ridge, dtype=float)
     l1 = np.asarray(l1, dtype=bool)
 
-    w = np.zeros((B, p))
-    act = ~l1
-    s = np.zeros((B, p))
-    sigma2 = np.ones(B)
+    w = np.zeros((B, p)) if w0 is None else np.array(w0, dtype=float)
+    act = ~l1 | (l1 & (w != 0))
+    s = np.where(l1 & act, np.sign(w), 0.0)
+    sigma2 = np.ones(B) if sigma0 is None else np.asarray(sigma0, dtype=float) ** 2
     live = np.arange(B)  # series whose sigma has not converged yet
     eye = np.eye(p)
-    for _ in range(max_outer):
+    outer = inner = 0
+    for outer in range(1, max_outer + 1):
         # The w-step, scaled by sigma²:
         #   0.5 ||y − Zw||² + sigma² (0.5 Σ ridge w² + Σ_l1 |w| / tau)
         s2 = sigma2[live]
         Gl = G[live] if per_series else np.broadcast_to(G, (live.size, p, p))
         H = Gl + (s2[:, None] * ridge[live])[:, :, None] * eye
-        wl, al, sl = _feature_sign(
+        wl, al, sl, steps = _feature_sign(
             H, C[live], s2 / tau[live], l1[live], w[live], act[live], s[live], 1e-9, max_inner
         )
+        inner += steps
         w[live], act[live], s[live] = wl, al, sl
         wGw = np.einsum("bp,bpq,bq->b", wl, Gl, wl)
         rss = np.maximum(yy[live] - 2 * np.einsum("bp,bp->b", C[live], wl) + wGw, 0.0)
@@ -154,6 +162,8 @@ def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=5
         live = live[~converged]
         if live.size == 0:
             break
+    if stats is not None:
+        stats.update(outer=outer, inner=inner)
     return w, np.sqrt(sigma2)
 
 
