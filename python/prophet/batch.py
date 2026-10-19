@@ -26,14 +26,20 @@ import os
 import pickle
 from collections import OrderedDict
 from copy import deepcopy
-from typing import Callable, Hashable, Iterable, Sequence, TypeVar, cast
+from typing import (
+    TYPE_CHECKING, Any, Callable, Hashable, Iterable, Mapping, Sequence, TypeVar, cast,
+)
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 
 from prophet.models import ModelInputData, TrendIndicator
 
-logger = logging.getLogger('prophet.batch')
+if TYPE_CHECKING:
+    from prophet.forecaster import Prophet
+
+logger: logging.Logger = logging.getLogger('prophet.batch')
 
 _T = TypeVar('_T')
 
@@ -45,7 +51,17 @@ _MIN_SIGMA = 1e-9
 _MULT_CHUNK = 16
 
 
-def _feature_sign(H, c, lam, l1, w, act, s, tol, max_iter):
+def _feature_sign(
+    H: np.ndarray,
+    c: np.ndarray,
+    lam: np.ndarray,
+    l1: np.ndarray,
+    w: np.ndarray,
+    act: np.ndarray,
+    s: np.ndarray,
+    tol: float,
+    max_iter: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Solve min 0.5 wᵀHw − cᵀw + lam Σ_{j in l1} |w_j|, batched over series.
 
     Feature-sign search (Lee et al., 2007). H: B × p × p, c: B × p, lam: B, l1: B × p.
@@ -108,8 +124,21 @@ def _feature_sign(H, c, lam, l1, w, act, s, tol, max_iter):
     return w, act, s, steps
 
 
-def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=500,
-              w0=None, sigma0=None, stats=None):
+def solve_map(
+    G: np.ndarray,
+    C: np.ndarray,
+    yy: np.ndarray,
+    T: np.ndarray,
+    ridge: np.ndarray,
+    l1: np.ndarray,
+    tau: np.ndarray,
+    tol: float = 1e-12,
+    max_outer: int = 200,
+    max_inner: int = 500,
+    w0: np.ndarray | None = None,
+    sigma0: np.ndarray | None = None,
+    stats: dict[str, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """MAP estimate from sufficient statistics, batched over B series.
 
     Parameters
@@ -175,7 +204,15 @@ def solve_map(G, C, yy, T, ridge, l1, tau, tol=1e-12, max_outer=200, max_inner=5
     return w, np.sqrt(sigma2)
 
 
-def kkt_violation(G, C, w, sigma, ridge, l1, tau):
+def kkt_violation(
+    G: np.ndarray,
+    C: np.ndarray,
+    w: np.ndarray,
+    sigma: np.ndarray,
+    ridge: np.ndarray,
+    l1: np.ndarray,
+    tau: np.ndarray,
+) -> np.ndarray:
     """Largest violation of the optimality conditions for w (given sigma), per series,
     in units of the L1 threshold 1 / tau. Zero at an exact optimum."""
     C = np.asarray(C, dtype=float)
@@ -190,7 +227,7 @@ def kkt_violation(G, C, w, sigma, ridge, l1, tau):
     return viol.max(axis=1) / inv_tau[:, 0]
 
 
-def unsupported_reason(model) -> str | None:
+def unsupported_reason(model: Prophet) -> str | None:
     """Why this (unfitted) model can't use the batched solver, or None if it can.
 
     Checks the configuration only. Whether every component is additive is known only
@@ -208,12 +245,12 @@ def unsupported_reason(model) -> str | None:
     return None
 
 
-def has_multiplicative_terms(model_inputs) -> bool:
+def has_multiplicative_terms(model_inputs: ModelInputData) -> bool:
     """True if any feature is multiplicative (then yhat is not linear in the parameters)."""
     return bool(np.any(np.asarray(model_inputs.s_m) != 0))
 
 
-def design_matrix(model_inputs) -> np.ndarray:
+def design_matrix(model_inputs: ModelInputData) -> np.ndarray:
     """Z such that the fitted values (scaled) are Z @ [k, m, delta, beta].
 
     Valid for linear or flat growth with additive components only. For flat growth the
@@ -240,7 +277,7 @@ class _Layout:
     slots are padding that solves to exactly 0.
     """
 
-    def __init__(self, S: list[int], K: list[int]):
+    def __init__(self, S: list[int], K: list[int]) -> None:
         self.S = np.asarray(S)
         self.K = np.asarray(K)
         self.S_max = int(self.S.max())
@@ -259,7 +296,12 @@ class _Layout:
                 w_b[2 + self.S_max:2 + self.S_max + K].copy())
 
 
-def stack_problems(problems):
+def stack_problems(
+    problems: Sequence[tuple[np.ndarray, Any, Sequence[float], float]],
+) -> tuple[
+    _Layout, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray,
+]:
     """Stack per-series problems into padded batch arrays for `solve_map`.
 
     problems: list of (Z, y, sigmas, tau), where Z comes from `design_matrix`.
@@ -297,7 +339,17 @@ def stack_problems(problems):
     return layout, G, C, yy, T, ridge, l1, tau
 
 
-def log_posterior(G, C, yy, T, w, sigma, ridge, l1, tau) -> np.ndarray:
+def log_posterior(
+    G: np.ndarray,
+    C: np.ndarray,
+    yy: np.ndarray,
+    T: np.ndarray,
+    w: np.ndarray,
+    sigma: np.ndarray,
+    ridge: np.ndarray,
+    l1: np.ndarray,
+    tau: np.ndarray,
+) -> np.ndarray:
     """Log posterior per series, with the same constants dropped as Stan's lp__."""
     Gw = np.einsum("bpq,bq->bp", G, w) if G.ndim == 3 else w @ G
     rss = yy - 2 * np.einsum("bp,bp->b", C, w) + np.einsum("bp,bp->b", w, Gw)
@@ -307,11 +359,19 @@ def log_posterior(G, C, yy, T, w, sigma, ridge, l1, tau) -> np.ndarray:
             - T * np.log(sigma) - rss / (2 * sigma ** 2))
 
 
-def set_params(model, k, m, delta, beta, sigma_obs, lp) -> None:
+def set_params(
+    model: Prophet,
+    k: float,
+    m: float,
+    delta: np.ndarray,
+    beta: np.ndarray,
+    sigma_obs: float,
+    lp: float,
+) -> None:
     """Store a MAP solution on a preprocessed model in the same form as Prophet.fit."""
     delta = np.asarray(delta, dtype=float)
     # Stan also returns the fitted (scaled) trend over the history, a transformed parameter.
-    t = model.history['t'].to_numpy(dtype=float)
+    t = cast(pd.DataFrame, model.history)['t'].to_numpy(dtype=float)
     if model.growth == 'flat':
         trend = np.full(len(t), float(m))
     else:
@@ -332,7 +392,7 @@ def set_params(model, k, m, delta, beta, sigma_obs, lp) -> None:
     _fold_dummy_changepoint(model)
 
 
-def set_constant_params(model, num_regressors: int) -> None:
+def set_constant_params(model: Prophet, num_regressors: int) -> None:
     """Prophet.fit's rule for a constant history: initial params, sigma_obs = 1e-9."""
     params = dataclasses.asdict(model.calculate_initial_params(num_regressors))
     params['sigma_obs'] = 1e-9
@@ -341,14 +401,14 @@ def set_constant_params(model, num_regressors: int) -> None:
     _fold_dummy_changepoint(model)
 
 
-def is_constant(model) -> bool:
-    y = model.history['y']
+def is_constant(model: Prophet) -> bool:
+    y = cast(pd.DataFrame, model.history)['y']
     return bool(y.min() == y.max())
 
 
-def _fold_dummy_changepoint(model) -> None:
+def _fold_dummy_changepoint(model: Prophet) -> None:
     # Same as Prophet.fit: with no changepoints, delta (for the dummy one at t=0) goes into k.
-    if len(model.changepoints) == 0:
+    if len(cast(pd.Series, model.changepoints)) == 0:
         model.params['k'] = model.params['k'] + model.params['delta'].reshape(-1)
         model.params['delta'] = np.zeros(model.params['delta'].shape).reshape((-1, 1))
 
@@ -361,18 +421,20 @@ class _SharedFeatures:
     K: int
     sigmas: Sequence[float]
     component_cols: pd.DataFrame
-    modes: dict
+    modes: dict[Any, list[str]]
     train_holiday_names: pd.Series | None
     Z: np.ndarray | None    # design matrix; None if multiplicative
 
 
-def _history_key(df) -> bytes:
+def _history_key(df: pd.DataFrame) -> bytes:
     """Identifies the history dates (rows with non-null y), in sorted order."""
     ds = pd.to_datetime(df.loc[df['y'].notnull(), 'ds'])
     return np.sort(ds.to_numpy(dtype='datetime64[ns]')).tobytes()
 
 
-def _preprocess_shared(model, df, shared: _SharedFeatures) -> ModelInputData:
+def _preprocess_shared(
+    model: Prophet, df: pd.DataFrame, shared: _SharedFeatures
+) -> ModelInputData:
     """Same result as model.preprocess(df), reusing date-only features from `shared`.
 
     Mirrors Prophet.preprocess step by step; only make_all_seasonality_features is
@@ -391,15 +453,16 @@ def _preprocess_shared(model, df, shared: _SharedFeatures) -> ModelInputData:
     model.fit_kwargs = {}
     model.set_changepoints()
     cap = np.zeros(model.history.shape[0])
+    changepoints_t = cast(npt.NDArray[np.float64], model.changepoints_t)
     return ModelInputData(
         T=model.history.shape[0],
-        S=len(model.changepoints_t),
+        S=len(changepoints_t),
         K=shared.K,
         tau=model.changepoint_prior_scale,
         trend_indicator=TrendIndicator[model.growth.upper()].value,
         y=model.history['y_scaled'],
         t=model.history['t'],
-        t_change=model.changepoints_t,
+        t_change=changepoints_t,
         X=shared.X,
         sigmas=shared.sigmas,
         s_a=shared.component_cols['additive_terms'],
@@ -408,7 +471,18 @@ def _preprocess_shared(model, df, shared: _SharedFeatures) -> ModelInputData:
     )
 
 
-def _prepare(df, id_col, make_model, share_dates):
+def _prepare(
+    df: pd.DataFrame,
+    id_col: str,
+    make_model: Callable[[Hashable], Prophet],
+    share_dates: bool,
+) -> tuple[
+    list[Hashable],
+    list[tuple[Hashable, Prophet, ModelInputData, np.ndarray]],
+    list[tuple[Hashable, Prophet, ModelInputData]],
+    list[tuple[Hashable, Prophet]],
+    list[tuple[Hashable, pd.DataFrame, str]],
+]:
     """Create and preprocess one model per series and sort them into batch / constant /
     fallback. With share_dates, series with identical history dates reuse date-only work.
 
@@ -434,8 +508,10 @@ def _prepare(df, id_col, make_model, share_dates):
             Z = None if has_multiplicative_terms(inputs) else design_matrix(inputs)
             if key is not None:
                 shared_by_dates[key] = _SharedFeatures(
-                    X=inputs.X, K=inputs.K, sigmas=inputs.sigmas, component_cols=model.train_component_cols,
-                    modes=model.component_modes, train_holiday_names=model.train_holiday_names, Z=Z,
+                    X=inputs.X, K=inputs.K, sigmas=inputs.sigmas,
+                    component_cols=cast(pd.DataFrame, model.train_component_cols),
+                    modes=cast(dict, model.component_modes),
+                    train_holiday_names=model.train_holiday_names, Z=Z,
                 )
         else:
             inputs = _preprocess_shared(model, series_df, shared)
@@ -446,7 +522,7 @@ def _prepare(df, id_col, make_model, share_dates):
         elif has_multiplicative_terms(inputs):
             mult.append((sid, model, inputs))
         else:
-            batch.append((sid, model, inputs, Z))
+            batch.append((sid, model, inputs, cast(np.ndarray, Z)))  # additive: Z was built
     return order, batch, mult, constant, fallback
 
 
@@ -458,14 +534,25 @@ def _group_by(items: Iterable[_T], key: Callable[[_T], Hashable]) -> list[list[_
     return list(groups.values())
 
 
-def _fit_chunk(chunk_df, id_col, make_model, prophet_kwargs):
+def _fit_chunk(
+    chunk_df: pd.DataFrame,
+    id_col: str,
+    make_model: Callable[[Hashable], Prophet] | None,
+    prophet_kwargs: dict[str, Any],
+) -> dict[Hashable, Prophet]:
     """Worker for fit_many(n_jobs > 1): fit one chunk of series in this process."""
     if make_model is None:
         return fit_many(chunk_df, id_col=id_col, **prophet_kwargs)
     return fit_many(chunk_df, id_col=id_col, make_model=make_model)
 
 
-def _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs):
+def _fit_many_parallel(
+    df: pd.DataFrame,
+    id_col: str,
+    make_model: Callable[[Hashable], Prophet] | None,
+    n_jobs: int,
+    prophet_kwargs: dict[str, Any],
+) -> dict[Hashable, Prophet]:
     if make_model is not None:
         try:
             pickle.dumps(make_model)
@@ -498,7 +585,13 @@ def _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs):
     return {sid: models[sid] for sid in ids}
 
 
-def fit_many(df, id_col='unique_id', make_model=None, n_jobs=1, **prophet_kwargs):
+def fit_many(
+    df: pd.DataFrame,
+    id_col: str = 'unique_id',
+    make_model: Callable[[Hashable], Prophet] | None = None,
+    n_jobs: int = 1,
+    **prophet_kwargs: Any,
+) -> dict[Hashable, Prophet]:
     """Fit one Prophet model per series, solving all supported series together.
 
     Parameters
@@ -541,7 +634,7 @@ def fit_many(df, id_col='unique_id', make_model=None, n_jobs=1, **prophet_kwargs
 
     share_dates = make_model is None
     if make_model is None:
-        def make_model(series_id):
+        def make_model(series_id: Hashable) -> Prophet:
             return Prophet(**prophet_kwargs)
     elif prophet_kwargs:
         raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
@@ -553,7 +646,7 @@ def fit_many(df, id_col='unique_id', make_model=None, n_jobs=1, **prophet_kwargs
     # to another's size. Each series' arithmetic then depends only on its own data,
     # which makes results bit-identical however the series are batched (and so for any
     # n_jobs). Padding time rows with zeros is exact and needs no grouping.
-    for group in _group_by(batch, lambda item: (len(item[2].t_change), item[2].X.shape[1])):
+    for group in _group_by(batch, lambda item: (len(item[2].t_change), item[2].K)):
         problems = [(Z, inputs.y, inputs.sigmas, inputs.tau) for _, _, inputs, Z in group]
         layout, G, C, yy, T, ridge, l1, tau = stack_problems(problems)
         w, sigma = solve_map(G, C, yy, T, ridge, l1, tau)
@@ -565,7 +658,7 @@ def fit_many(df, id_col='unique_id', make_model=None, n_jobs=1, **prophet_kwargs
 
     # Multiplicative models: the design changes every iteration, so the solver needs each
     # series' full data; chunks keep memory bounded.
-    def mult_shape(item):
+    def mult_shape(item: tuple[Hashable, Prophet, ModelInputData]) -> tuple[int, int, int]:
         s_m = np.asarray(item[2].s_m) != 0
         return len(np.atleast_1d(item[2].t_change)), int((~s_m).sum()), int(s_m.sum())
 
@@ -591,14 +684,28 @@ def fit_many(df, id_col='unique_id', make_model=None, n_jobs=1, **prophet_kwargs
     return {sid: models[sid] for sid in order}
 
 
-def _gram(Z, y):
+def _gram(Z: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Batched Zᵀ Z, Zᵀ y, yᵀ y for Z: B × T × p, y: B × T."""
     G = np.matmul(Z.transpose(0, 2, 1), Z)
     C = np.matmul(Z.transpose(0, 2, 1), y[:, :, None])[..., 0]
     return G, C, np.einsum('bt,bt->b', y, y)
 
 
-def _multiplicative_log_posterior(ZT, Xa, Xm, y, T, theta, ba, bm, sigma, S, ridge_a, ridge_m, tau):
+def _multiplicative_log_posterior(
+    ZT: np.ndarray,
+    Xa: np.ndarray,
+    Xm: np.ndarray,
+    y: np.ndarray,
+    T: np.ndarray,
+    theta: np.ndarray,
+    ba: np.ndarray,
+    bm: np.ndarray,
+    sigma: np.ndarray,
+    S: np.ndarray,
+    ridge_a: np.ndarray,
+    ridge_m: np.ndarray,
+    tau: np.ndarray,
+) -> np.ndarray:
     trend = np.matmul(ZT, theta[:, :, None])[..., 0]
     yhat = (trend * (1 + np.matmul(Xm, bm[:, :, None])[..., 0])
             + np.matmul(Xa, ba[:, :, None])[..., 0])
@@ -610,8 +717,21 @@ def _multiplicative_log_posterior(ZT, Xa, Xm, y, T, theta, ba, bm, sigma, S, rid
             - sigma ** 2 / (2 * 0.5 ** 2) - T * np.log(sigma) - rss / (2 * sigma ** 2))
 
 
-def solve_map_multiplicative(ZT, Xa, Xm, y, T, delta_mask, ridge_a, ridge_m, tau,
-                             tol=0.0, max_iter=100, method='hybrid', switch_after=10):
+def solve_map_multiplicative(
+    ZT: np.ndarray,
+    Xa: np.ndarray,
+    Xm: np.ndarray,
+    y: np.ndarray,
+    T: np.ndarray,
+    delta_mask: np.ndarray,
+    ridge_a: np.ndarray,
+    ridge_m: np.ndarray,
+    tau: np.ndarray,
+    tol: float = 0.0,
+    max_iter: int = 100,
+    method: str = 'hybrid',
+    switch_after: int = 10,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """MAP for models with multiplicative features.
 
         yhat = (ZT θ) ∘ (1 + Xm β_m) + Xa β_a,   θ = [k, m, δ]
@@ -648,7 +768,9 @@ def solve_map_multiplicative(ZT, Xa, Xm, y, T, delta_mask, ridge_a, ridge_m, tau
     sigma = np.ones(B)
     args = (ZT, Xa, Xm, y, T)
 
-    def lp_at(L, th, a, m, sg):
+    def lp_at(
+        L: np.ndarray, th: np.ndarray, a: np.ndarray, m: np.ndarray, sg: np.ndarray
+    ) -> np.ndarray:
         return _multiplicative_log_posterior(
             ZT[L], Xa[L], Xm[L], y[L], T[L], th, a, m, sg, delta_mask[L],
             ridge_a[L], ridge_m[L], tau[L])
@@ -733,7 +855,7 @@ class _MultSeries:
 class _MultiplicativeBatch:
     """Zero-padded arrays for `solve_map_multiplicative`, built from model inputs."""
 
-    def __init__(self, inputs_list):
+    def __init__(self, inputs_list: Sequence[ModelInputData]) -> None:
         B = len(inputs_list)
         parts = []
         for inputs in inputs_list:
@@ -773,11 +895,15 @@ class _MultiplicativeBatch:
             self.ridge_m[b, :len(p.im)] = 1 / p.sig[p.im] ** 2
             self.tau[b] = p.tau
 
-    def solve(self, **kw):
+    def solve(
+        self, **kw: Any
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
         return solve_map_multiplicative(self.ZT, self.Xa, self.Xm, self.y, self.T, self.delta_mask,
                                         self.ridge_a, self.ridge_m, self.tau, **kw)
 
-    def unpack(self, b, theta, ba, bm):
+    def unpack(
+        self, b: int, theta: np.ndarray, ba: np.ndarray, bm: np.ndarray
+    ) -> tuple[float, float, np.ndarray, np.ndarray]:
         """(k, m, delta, beta) for series b, with beta in the model's feature order."""
         p = self.parts[b]
         beta = np.zeros(p.K)
@@ -786,13 +912,13 @@ class _MultiplicativeBatch:
         return float(theta[b, 0]), float(theta[b, 1]), theta[b, 2:2 + p.S].copy(), beta
 
 
-def _as_additive(inputs):
+def _as_additive(inputs: ModelInputData) -> ModelInputData:
     """Inputs with every feature marked additive (for building the trend columns of Z)."""
-    return dataclasses.replace(inputs, s_a=np.ones(len(np.asarray(inputs.s_a))),
-                               s_m=np.zeros(len(np.asarray(inputs.s_m))))
+    return dataclasses.replace(inputs, s_a=[1] * len(np.asarray(inputs.s_a)),
+                               s_m=[0] * len(np.asarray(inputs.s_m)))
 
 
-def _encode_id(series_id) -> bytes:
+def _encode_id(series_id: Hashable) -> bytes:
     """Canonical, process-independent byte encoding of a series id."""
     if isinstance(series_id, str):
         return b's' + series_id.encode('utf-8')
@@ -813,13 +939,13 @@ def _encode_id(series_id) -> bytes:
     )
 
 
-def stable_id_hash(series_id) -> int:
+def stable_id_hash(series_id: Hashable) -> int:
     """128-bit hash of a series id, identical across processes and Python runs
     (unlike the built-in hash(), which is salted per process)."""
     return int.from_bytes(hashlib.blake2b(_encode_id(series_id), digest_size=16).digest(), 'big')
 
 
-def series_rng(seed: int, series_id) -> np.random.Generator:
+def series_rng(seed: int, series_id: Hashable) -> np.random.Generator:
     """Random generator for one series, determined only by (seed, series_id).
 
     Independent of how many series there are, their order, and which process or batch
@@ -828,7 +954,11 @@ def series_rng(seed: int, series_id) -> np.random.Generator:
     return np.random.default_rng(np.random.SeedSequence(seed, spawn_key=(stable_id_hash(series_id),)))
 
 
-def _predict_chunk(items, seed, history_uncertainty):
+def _predict_chunk(
+    items: Sequence[tuple[Hashable, Prophet, pd.DataFrame]],
+    seed: int,
+    history_uncertainty: bool,
+) -> list[tuple[Hashable, pd.DataFrame]]:
     """Worker: predict a list of (series_id, model, future) with per-series generators."""
     return [
         (sid, model.predict(future, history_uncertainty=history_uncertainty, rng=series_rng(seed, sid)))
@@ -836,8 +966,16 @@ def _predict_chunk(items, seed, history_uncertainty):
     ]
 
 
-def predict_many(models, futures=None, periods=None, freq='D', include_history=True,
-                 seed=None, n_jobs=1, history_uncertainty=True):
+def predict_many(
+    models: Mapping[Hashable, Prophet],
+    futures: Mapping[Hashable, pd.DataFrame] | None = None,
+    periods: int | None = None,
+    freq: str = 'D',
+    include_history: bool = True,
+    seed: int | None = None,
+    n_jobs: int = 1,
+    history_uncertainty: bool = True,
+) -> dict[Hashable, pd.DataFrame]:
     """Forecast many fitted models, reproducibly, optionally in parallel.
 
     Parameters
@@ -867,7 +1005,7 @@ def predict_many(models, futures=None, periods=None, freq='D', include_history=T
     items = []
     for sid, model in models.items():
         future = (futures[sid] if futures is not None
-                  else model.make_future_dataframe(periods, freq=freq, include_history=include_history))
+                  else model.make_future_dataframe(cast(int, periods), freq=freq, include_history=include_history))
         items.append((sid, model, future))
 
     n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
