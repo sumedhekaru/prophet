@@ -962,11 +962,12 @@ def solve_map_multiplicative(
     decrease. method='alternating': exact block solves, (θ, β_a) given β_m, then
     (β_m, β_a) given θ; also monotone, but can zig-zag for hundreds of iterations.
     The joint problem is non-convex (bilinear), so the result is a stationary point.
-    Each block or Gauss-Newton subproblem takes one exact w-step at the current sigma
-    (solve_map with max_outer=1) rather than iterating sigma to convergence: sigma is set
-    in closed form at every trial point anyway, so the fixed points are the same and the
-    hard cases run far faster. Gauss-Newton steps are damped (Levenberg-Marquardt), per
-    series, so that they stay local early on.
+    Each Gauss-Newton subproblem takes one exact w-step at the current sigma (solve_map
+    with max_outer=1) rather than iterating sigma to convergence: sigma is set in closed
+    form at every trial point anyway, so the fixed points are the same and the hard cases
+    run far faster. Gauss-Newton steps are damped (Levenberg-Marquardt), per series, so
+    that they stay local early on. The alternating phase keeps exact block solves: cutting
+    them short changes which basin Gauss-Newton starts in.
     Stops per series when lp changes by no more than `tol` (relative). With the default
     tol=0 that is when a step no longer improves lp (lp never decreases), which gives
     KKT violations around 1e-9 in about 8 Gauss-Newton iterations.
@@ -1022,8 +1023,7 @@ def solve_map_multiplicative(
             wA, sigma[L] = solve_map(
                 G, C, yy, T[L], np.concatenate([ridge_T[L], ridge_a[L]], axis=1),
                 np.concatenate([l1_T[L], np.zeros((len(L), Ka), bool)], axis=1),
-                tau[L], w0=np.concatenate([theta[L], ba[L]], axis=1), sigma0=sigma[L],
-                max_outer=1)
+                tau[L], w0=np.concatenate([theta[L], ba[L]], axis=1), sigma0=sigma[L])
             theta[L], ba[L] = wA[:, :P], wA[:, P:]
             trend = np.matmul(ZT[L], theta[L][:, :, None])[..., 0]
             ZB = np.concatenate([trend[:, :, None] * Xm[L], Xa[L]], axis=2)
@@ -1031,7 +1031,7 @@ def solve_map_multiplicative(
             wB, sigma[L] = solve_map(
                 G, C, yy, T[L], np.concatenate([ridge_m[L], ridge_a[L]], axis=1),
                 np.zeros((len(L), Km + Ka), bool), tau[L],
-                w0=np.concatenate([bm[L], ba[L]], axis=1), sigma0=sigma[L], max_outer=1)
+                w0=np.concatenate([bm[L], ba[L]], axis=1), sigma0=sigma[L])
             bm[L], ba[L] = wB[:, :Km], wB[:, Km:]
             lp_new = lp_at(L, theta[L], ba[L], bm[L], sigma[L])
         else:
