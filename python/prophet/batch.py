@@ -730,7 +730,7 @@ def fit_many(
     # Series are solved in groups of identical coordinate shape, so no series is padded
     # to another's size. Each series' arithmetic then depends only on its own data,
     # which makes results bit-identical however the series are batched (and so for any
-    # n_jobs). Padding time rows with zeros is exact and needs no grouping.
+    # n_jobs).
     for group in _group_by(batch, lambda item: (len(item[2].t_change), item[2].K)):
         problems = [(Z, inputs.y, inputs.sigmas, inputs.tau) for _, _, inputs, Z in group]
         layout, G, C, yy, T, ridge, l1, tau = stack_problems(problems)
@@ -742,10 +742,14 @@ def fit_many(
             models[sid] = model
 
     # Multiplicative models: the design changes every iteration, so the solver needs each
-    # series' full data; chunks keep memory bounded.
-    def mult_shape(item: tuple[Hashable, Prophet, ModelInputData]) -> tuple[int, int, int]:
+    # series' full data; chunks keep memory bounded. Groups also share the length T: zero
+    # time rows are exact in exact arithmetic, but BLAS rounding depends on the padded size.
+    def mult_shape(
+        item: tuple[Hashable, Prophet, ModelInputData]
+    ) -> tuple[int, int, int, int]:
         s_m = np.asarray(item[2].s_m) != 0
-        return len(np.atleast_1d(item[2].t_change)), int((~s_m).sum()), int(s_m.sum())
+        return (len(np.atleast_1d(item[2].t_change)), int((~s_m).sum()), int(s_m.sum()),
+                len(np.asarray(item[2].y)))
 
     for group in _group_by(mult, mult_shape):
         for start in range(0, len(group), _MULT_CHUNK):
