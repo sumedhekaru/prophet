@@ -1546,12 +1546,32 @@ def cross_validation_many(
         seed = cast(int, np.random.SeedSequence().entropy)
         logger.info('cross_validation_many: no seed given, using seed=%d', seed)
     horizon_td = pd.Timedelta(horizon)
+    n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
     items = list(models.items())
-    groups = [items[i:i + _CV_GROUP] for i in range(0, len(items), _CV_GROUP)]
     results: dict[Hashable, pd.DataFrame] = {}
-    for group in groups:
-        results.update(_cv_group(group, horizon_td, period, initial, cutoffs, seed, on_error,
-                                 extra_output_columns))
+    if n_jobs == 1 or len(items) <= 1:
+        for i in range(0, len(items), _CV_GROUP):
+            results.update(_cv_group(items[i:i + _CV_GROUP], horizon_td, period, initial,
+                                     cutoffs, seed, on_error, extra_output_columns))
+    else:
+        # Series whose models were fit by Stan refit by Stan at every cutoff (~100x slower),
+        # so they go first, in small groups; results don't depend on the grouping.
+        stan = [it for it in items if it[1].stan_fit is not None]
+        rest = [it for it in items if it[1].stan_fit is None]
+        groups = []
+        for part in (stan, rest):
+            size = max(1, min(_CV_GROUP, -(-len(part) // (n_jobs * 4))))
+            groups += [part[i:i + size] for i in range(0, len(part), size)]
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+
+        ctx = multiprocessing.get_context('spawn')
+        n = len(groups)
+        with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx) as pool:
+            for part in pool.map(_cv_group, groups, [horizon_td] * n, [period] * n,
+                                 [initial] * n, [cutoffs] * n, [seed] * n, [on_error] * n,
+                                 [extra_output_columns] * n):
+                results.update(part)
     ordered = {sid: results[sid] for sid in models if sid in results}
     if not as_frame:
         return ordered
