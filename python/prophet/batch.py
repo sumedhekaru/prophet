@@ -27,7 +27,8 @@ import pickle
 from collections import OrderedDict
 from copy import deepcopy
 from typing import (
-    TYPE_CHECKING, Any, Callable, Hashable, Iterable, Mapping, Sequence, TypeVar, cast,
+    TYPE_CHECKING, Any, Callable, Hashable, Iterable, Literal, Mapping, Sequence, TypeVar,
+    cast,
 )
 
 import numpy as np
@@ -1305,7 +1306,7 @@ def series_rng(seed: int, series_id: Hashable) -> np.random.Generator:
 def _predict_chunk(
     items: Sequence[tuple[Hashable, Prophet, pd.DataFrame]],
     seed: int,
-    history_uncertainty: bool,
+    history_uncertainty: bool | Literal['analytic'],
 ) -> list[tuple[Hashable, pd.DataFrame]]:
     """Worker: predict a list of (series_id, model, future) with per-series generators."""
     return [
@@ -1323,7 +1324,7 @@ def predict_many(
     include_history: bool = True,
     seed: int | None = None,
     n_jobs: int = 1,
-    history_uncertainty: bool = True,
+    history_uncertainty: bool | Literal['analytic'] = True,
 ) -> dict[Hashable, pd.DataFrame]:
     """Forecast many fitted models, reproducibly, optionally in parallel.
 
@@ -1339,7 +1340,7 @@ def predict_many(
         n_jobs, order, or which other series are predicted. None draws a fresh seed,
         which is logged and stored in every forecast's `attrs['seed']`.
     n_jobs: Number of worker processes; 1 runs in this process, -1 uses all CPUs.
-    history_uncertainty: Passed to Prophet.predict.
+    history_uncertainty: Passed to Prophet.predict (True, False or 'analytic').
 
     Returns
     -------
