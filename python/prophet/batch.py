@@ -1357,3 +1357,207 @@ def predict_many(
     for fc in forecasts.values():
         fc.attrs['seed'] = seed
     return {sid: forecasts[sid] for sid in models}
+
+
+# Series per fit_many call in cross_validation_many: every cutoff copies a series' history,
+# so this bounds memory; results don't depend on it.
+_CV_GROUP = 64
+
+
+def _cv_plan(
+    model: Prophet,
+    horizon: pd.Timedelta,
+    period: str | pd.Timedelta | None,
+    initial: str | pd.Timedelta | None,
+    cutoffs: list[pd.Timestamp] | None,
+    extra_output_columns: str | list[str] | None,
+) -> tuple[pd.DataFrame, list[str], list[pd.Timestamp]]:
+    """Stock cross_validation's setup for one model: history, output columns and cutoffs."""
+    from prophet.diagnostics import generate_cutoffs
+
+    if model.history is None:
+        raise Exception('Model has not been fit. Fitting the model provides contextual '
+                        'parameters for cross validation.')
+    df = model.history.copy().reset_index(drop=True)
+    predict_columns = ['ds', 'yhat']
+    if model.uncertainty_samples:
+        predict_columns.extend(['yhat_lower', 'yhat_upper'])
+    if extra_output_columns is not None:
+        if isinstance(extra_output_columns, str):
+            extra_output_columns = [extra_output_columns]
+        predict_columns.extend([c for c in extra_output_columns if c not in predict_columns])
+    period_max = 0.
+    for s in model.seasonalities.values():
+        period_max = max(period_max, s['period'])
+    seasonality_dt = pd.Timedelta(str(period_max) + ' days')
+    if cutoffs is None:
+        period_td = 0.5 * horizon if period is None else pd.Timedelta(period)
+        initial_td = (max(3 * horizon, seasonality_dt) if initial is None
+                      else pd.Timedelta(initial))
+        cuts = list(generate_cutoffs(df, horizon, initial_td, period_td))
+    else:
+        if min(cutoffs) <= df['ds'].min():
+            raise ValueError('Minimum cutoff value is not strictly greater than min date in '
+                             'history')
+        if max(cutoffs) > df['ds'].max() - horizon:
+            raise ValueError('Maximum cutoff value is greater than end date minus horizon, no '
+                             'value for cross-validation remaining')
+        initial_td = cutoffs[0] - df['ds'].min()
+        cuts = list(cutoffs)
+    if initial_td < seasonality_dt:
+        logger.warning('Seasonality has period of %s days which is larger than initial window. '
+                       'Consider increasing initial.', period_max)
+    for cutoff in cuts:
+        if (df['ds'] <= cutoff).sum() < 2:
+            raise Exception('Less than two datapoints before cutoff. Increase initial window.')
+    return df, predict_columns, cuts
+
+
+def _cv_future_columns(m: Prophet) -> list[str]:
+    """Columns predict needs, as in stock single_cutoff_forecast."""
+    columns = ['ds']
+    if m.growth == 'logistic':
+        columns.append('cap')
+        if m.logistic_floor:
+            columns.append('floor')
+    columns.extend(m.extra_regressors.keys())
+    columns.extend([props['condition_name'] for props in m.seasonalities.values()
+                    if props['condition_name'] is not None])
+    return list(dict.fromkeys(columns))
+
+
+class _CopyAtCutoff:
+    """make_model / fit_kwargs for fit_many over (series id, cutoff) keys."""
+
+    def __init__(self, models: Mapping[Hashable, Prophet]) -> None:
+        self.models = models
+
+    def model(self, key: Hashable) -> Prophet:
+        from prophet.diagnostics import prophet_copy
+
+        sid, cutoff = cast(tuple, key)
+        return prophet_copy(self.models[sid], cutoff)
+
+    def fit_kwargs(self, key: Hashable) -> dict[str, Any]:
+        return self.models[cast(tuple, key)[0]].fit_kwargs
+
+
+def _cv_group(
+    items: Sequence[tuple[Hashable, Prophet]],
+    horizon: pd.Timedelta,
+    period: str | pd.Timedelta | None,
+    initial: str | pd.Timedelta | None,
+    cutoffs: list[pd.Timestamp] | None,
+    seed: int,
+    on_error: str,
+    extra_output_columns: str | list[str] | None,
+) -> dict[Hashable, pd.DataFrame]:
+    """Cross-validate a group of series: one fit_many call for all their refits."""
+    plans: dict[Hashable, tuple[Prophet, pd.DataFrame, list[str], list[pd.Timestamp]]] = {}
+    for sid, model in items:
+        try:
+            plans[sid] = (model,) + _cv_plan(model, horizon, period, initial, cutoffs,
+                                             extra_output_columns)
+        except Exception as e:
+            _series_failed(sid, e, on_error)
+            if on_error == 'raise':
+                raise
+    keys = [(sid, c) for sid, (_, _, _, cuts) in plans.items() for c in cuts]
+    if not keys:
+        return {}
+    frames = []
+    for sid, cutoff in keys:
+        hist = plans[sid][1]
+        hist = hist[hist['ds'] <= cutoff]
+        frames.append(hist.assign(_cv_key=pd.Series([(sid, cutoff)] * len(hist),
+                                                     index=hist.index, dtype=object)))
+    copies = _CopyAtCutoff({sid: plan[0] for sid, plan in plans.items()})
+    fitted = fit_many(pd.concat(frames, ignore_index=True), id_col='_cv_key',
+                      make_model=copies.model, fit_kwargs=copies.fit_kwargs, on_error=on_error)
+    out: dict[Hashable, pd.DataFrame] = {}
+    for sid, (_, df, predict_columns, cuts) in plans.items():
+        if any((sid, c) not in fitted for c in cuts):
+            logger.warning('cross_validation_many: skipping series %r (a cutoff refit failed)',
+                           sid)
+            continue
+        try:
+            parts: list[pd.DataFrame] = []
+            for cutoff in cuts:
+                m = fitted[(sid, cutoff)]
+                index_predicted = (df['ds'] > cutoff) & (df['ds'] <= cutoff + horizon)
+                yhat = m.predict(df[index_predicted][_cv_future_columns(m)],
+                                 rng=series_rng(seed, (sid, int(cutoff.value))))
+                assert m.stan_backend
+                m.stan_backend.cleanup()
+                parts.append(pd.concat([
+                    yhat[predict_columns],
+                    df[index_predicted][['y']].reset_index(drop=True),
+                    pd.DataFrame({'cutoff': [cutoff] * len(yhat)}),
+                ], axis=1))
+            out[sid] = pd.concat(parts, axis=0).reset_index(drop=True)
+        except Exception as e:
+            _series_failed(sid, e, on_error)
+            if on_error == 'raise':
+                raise
+    return out
+
+
+def cross_validation_many(
+    models: Mapping[Hashable, Prophet],
+    horizon: str | pd.Timedelta,
+    period: str | pd.Timedelta | None = None,
+    initial: str | pd.Timedelta | None = None,
+    cutoffs: list[pd.Timestamp] | None = None,
+    n_jobs: int = 1,
+    seed: int | None = None,
+    as_frame: bool = False,
+    id_col: str = 'unique_id',
+    on_error: str = 'raise',
+    extra_output_columns: str | list[str] | None = None,
+) -> dict[Hashable, pd.DataFrame] | pd.DataFrame:
+    """Cross-validation for many fitted models, like prophet.diagnostics.cross_validation.
+
+    Per series it uses stock's cutoffs and model copies (prophet_copy) and returns stock's
+    output format. The refits of many series and cutoffs are solved together by fit_many
+    (Prophet.fit for configurations it doesn't batch, with each model's fit_kwargs), so
+    batched refits are the exact MAP rather than Stan's approximate one. Forecasts are
+    seeded per (series, cutoff), so results don't depend on n_jobs or order.
+
+    Parameters
+    ----------
+    models: Dict mapping series id to a fitted Prophet model (e.g. from fit_many).
+    horizon, period, initial, cutoffs, extra_output_columns: As in cross_validation,
+        applied to every series.
+    n_jobs: Number of worker processes; 1 runs in this process, -1 uses all CPUs.
+    seed: Integer seed for the uncertainty intervals; None draws one and logs it.
+    as_frame: False (default) returns a dict of per-series DataFrames; True returns one
+        DataFrame with the series id in column `id_col`.
+    id_col: Name of the id column when as_frame=True.
+    on_error: 'raise' (default) or 'skip', as in fit_many.
+
+    Returns
+    -------
+    Dict mapping series id to its cross-validation DataFrame (stock format), in the order
+    of `models`, or one DataFrame if as_frame=True.
+    """
+    if on_error not in ('raise', 'skip'):
+        raise ValueError(f"on_error must be 'raise' or 'skip', got {on_error!r}.")
+    if seed is None:
+        seed = cast(int, np.random.SeedSequence().entropy)
+        logger.info('cross_validation_many: no seed given, using seed=%d', seed)
+    horizon_td = pd.Timedelta(horizon)
+    items = list(models.items())
+    groups = [items[i:i + _CV_GROUP] for i in range(0, len(items), _CV_GROUP)]
+    results: dict[Hashable, pd.DataFrame] = {}
+    for group in groups:
+        results.update(_cv_group(group, horizon_td, period, initial, cutoffs, seed, on_error,
+                                 extra_output_columns))
+    ordered = {sid: results[sid] for sid in models if sid in results}
+    if not as_frame:
+        return ordered
+    frames = []
+    for sid, cv in ordered.items():
+        cv = cv.copy()
+        cv.insert(0, id_col, [sid] * len(cv))
+        frames.append(cv)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
