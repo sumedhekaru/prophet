@@ -10,6 +10,7 @@ import logging
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from datetime import timedelta
+from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, Literal, SupportsFloat, cast
 
 if TYPE_CHECKING:
@@ -1472,7 +1473,7 @@ class Prophet:
         self,
         df: pd.DataFrame | None = None,
         vectorized: bool = True,
-        history_uncertainty: bool = True,
+        history_uncertainty: bool | Literal['analytic'] = True,
         rng: np.random.Generator | None = None,
     ) -> pd.DataFrame:
         """Predict using the prophet model.
@@ -1490,6 +1491,10 @@ class Prophet:
             computes them for every row. False leaves them NaN for history rows and only
             samples the future rows, which is much faster when the history is included;
             the future intervals are then exactly those of predicting the future rows alone.
+            'analytic' (MAP fits only) samples the future rows as False does and gives
+            history rows the exact limit of the sampled intervals: yhat +/- z * sigma_obs *
+            y_scale, with z the normal quantile for interval_width, and trend bounds equal
+            to the trend.
         rng: Optional numpy Generator for all random draws (uncertainty intervals,
             regressor models). None (the default) uses NumPy's global RNG, as before.
 
@@ -1499,6 +1504,15 @@ class Prophet:
         """
         if self.history is None:
             raise Exception('Model has not been fit.')
+        analytic = (isinstance(history_uncertainty, str)
+                    and history_uncertainty == 'analytic')
+        if not (analytic or isinstance(history_uncertainty, (bool, np.bool_))):
+            raise ValueError(
+                "history_uncertainty must be True, False or 'analytic', got {!r}."
+                .format(history_uncertainty))
+        if analytic and self.mcmc_samples > 0:
+            raise ValueError(
+                "history_uncertainty='analytic' requires a MAP fit (mcmc_samples=0).")
 
         regressor_samples = None
         if df is None:
@@ -1523,7 +1537,7 @@ class Prophet:
         df['trend'] = self.predict_trend(df)
         seasonal_components = self.predict_seasonal_components(df)
         if self.uncertainty_samples:
-            if history_uncertainty:
+            if history_uncertainty and not analytic:
                 intervals = self.predict_uncertainty(df, vectorized, regressor_samples, rng=rng)
             else:
                 intervals = self._future_uncertainty(df, vectorized, regressor_samples, rng=rng)
@@ -1542,6 +1556,8 @@ class Prophet:
                 df2['trend'] * (1 + df2['multiplicative_terms'])
                 + df2['additive_terms']
         )
+        if analytic and intervals is not None:
+            self._analytic_history_intervals(df2, (df['t'] <= 1).to_numpy())
         return df2
 
     @staticmethod
@@ -1754,6 +1770,32 @@ class Prophet:
                 df.loc[future].reset_index(drop=True), vectorized, future_samples, rng=rng)
             intervals.loc[future, columns] = future_intervals[columns].to_numpy()
         return intervals
+
+    def _analytic_history_intervals(
+        self, fcst: pd.DataFrame, history: np.ndarray
+    ) -> None:
+        """Fill yhat/trend intervals of history rows in closed form (MAP fits).
+
+        With one parameter set, history samples differ only by the Gaussian
+        noise (the sampled trend is deterministic for t <= 1), so the sampled
+        percentiles converge to yhat +/- z * sigma_obs * y_scale.
+
+        Parameters
+        ----------
+        fcst: Forecast dataframe with yhat and trend; updated in place.
+        history: Boolean mask of the history rows (t <= 1).
+        """
+        if not history.any():
+            return
+        z = NormalDist().inv_cdf((1 + self.interval_width) / 2)
+        sigma = float(np.ravel(self.params['sigma_obs'])[0])
+        half_width = z * sigma * cast(float, self.y_scale)
+        yhat = fcst.loc[history, 'yhat'].to_numpy()
+        trend = fcst.loc[history, 'trend'].to_numpy()
+        fcst.loc[history, 'yhat_lower'] = yhat - half_width
+        fcst.loc[history, 'yhat_upper'] = yhat + half_width
+        fcst.loc[history, 'trend_lower'] = trend
+        fcst.loc[history, 'trend_upper'] = trend
 
     def sample_posterior_predictive(
         self,
