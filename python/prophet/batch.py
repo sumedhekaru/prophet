@@ -37,7 +37,12 @@ import pandas as pd
 from prophet.models import ModelInputData, TrendIndicator
 
 if TYPE_CHECKING:
+    from typing import TypeAlias
+
     from prophet.forecaster import Prophet
+
+    # Prophet.fit keyword arguments: one dict for all series, or series_id -> dict.
+    _FitKwargs: TypeAlias = 'dict[str, Any] | Callable[[Hashable], dict[str, Any]] | None'
 
 logger: logging.Logger = logging.getLogger('prophet.batch')
 
@@ -522,7 +527,7 @@ def _history_key(df: pd.DataFrame) -> bytes:
 
 
 def _preprocess_shared(
-    model: Prophet, df: pd.DataFrame, shared: _SharedFeatures
+    model: Prophet, df: pd.DataFrame, shared: _SharedFeatures, fit_kwargs: dict[str, Any]
 ) -> ModelInputData:
     """Same result as model.preprocess(df), reusing date-only features from `shared`.
 
@@ -539,7 +544,7 @@ def _preprocess_shared(
     model.component_modes = deepcopy(shared.modes)
     if shared.train_holiday_names is not None:
         model.train_holiday_names = shared.train_holiday_names.copy()
-    model.fit_kwargs = {}
+    model.fit_kwargs = deepcopy(fit_kwargs)
     model.set_changepoints()
     cap = np.zeros(model.history.shape[0])
     changepoints_t = cast(npt.NDArray[np.float64], model.changepoints_t)
@@ -573,12 +578,17 @@ def _series_failed(sid: Hashable, e: Exception, on_error: str) -> None:
         logger.warning('fit_many: skipping series %r: %s: %s', sid, type(e).__name__, e)
 
 
+def _no_fit_kwargs(series_id: Hashable) -> dict[str, Any]:
+    return {}
+
+
 def _prepare(
     df: pd.DataFrame,
     id_col: str,
     make_model: Callable[[Hashable], Prophet],
     share_dates: bool,
     on_error: str = 'raise',
+    kwargs_for: Callable[[Hashable], dict[str, Any]] = _no_fit_kwargs,
 ) -> tuple[
     list[Hashable],
     list[tuple[Hashable, Prophet, ModelInputData, np.ndarray, pd.DataFrame]],
@@ -612,7 +622,7 @@ def _prepare(
                 key = _history_key(series_df) if share_dates else None
                 shared = shared_by_dates.get(key) if key is not None else None
                 if shared is None:
-                    inputs = model.preprocess(series_df)
+                    inputs = model.preprocess(series_df, **kwargs_for(sid))
                     Z = None if has_multiplicative_terms(inputs) else design_matrix(inputs)
                     if key is not None:
                         shared_by_dates[key] = _SharedFeatures(
@@ -622,7 +632,7 @@ def _prepare(
                             train_holiday_names=model.train_holiday_names, Z=Z,
                         )
                 else:
-                    inputs = _preprocess_shared(model, series_df, shared)
+                    inputs = _preprocess_shared(model, series_df, shared, kwargs_for(sid))
                     Z = shared.Z
                 if is_constant(model):
                     set_constant_params(model, inputs.K)
@@ -656,11 +666,14 @@ def _fit_chunk(
     make_model: Callable[[Hashable], Prophet] | None,
     prophet_kwargs: dict[str, Any],
     on_error: str,
+    fit_kwargs: _FitKwargs,
 ) -> dict[Hashable, Prophet]:
     """Worker for fit_many(n_jobs > 1): fit one chunk of series in this process."""
     if make_model is None:
-        return fit_many(chunk_df, id_col=id_col, on_error=on_error, **prophet_kwargs)
-    return fit_many(chunk_df, id_col=id_col, make_model=make_model, on_error=on_error)
+        return fit_many(chunk_df, id_col=id_col, on_error=on_error, fit_kwargs=fit_kwargs,
+                        **prophet_kwargs)
+    return fit_many(chunk_df, id_col=id_col, make_model=make_model, on_error=on_error,
+                    fit_kwargs=fit_kwargs)
 
 
 def _fit_many_parallel(
@@ -670,14 +683,17 @@ def _fit_many_parallel(
     n_jobs: int,
     prophet_kwargs: dict[str, Any],
     on_error: str,
+    fit_kwargs: _FitKwargs,
 ) -> dict[Hashable, Prophet]:
     """fit_many with n_jobs > 1: fit contiguous chunks of series in a process pool."""
-    if make_model is not None:
+    for name, fn in (('make_model', make_model), ('fit_kwargs', fit_kwargs)):
+        if fn is None:
+            continue
         try:
-            pickle.dumps(make_model)
+            pickle.dumps(fn)
         except Exception as e:
             raise ValueError(
-                'With n_jobs != 1, make_model must be picklable (a module-level function, '
+                f'With n_jobs != 1, {name} must be picklable (a module-level function, '
                 'not a lambda or closure).'
             ) from e
     rows_by_id = df.groupby(id_col, sort=False).indices
@@ -696,7 +712,7 @@ def _fit_many_parallel(
     with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx) as pool:
         n = len(chunks)
         parts = list(pool.map(_fit_chunk, chunks, [id_col] * n, [make_model] * n,
-                              [prophet_kwargs] * n, [on_error] * n))
+                              [prophet_kwargs] * n, [on_error] * n, [fit_kwargs] * n))
     models = {}
     for part in parts:
         models.update(part)
@@ -711,6 +727,7 @@ def fit_many(
     make_model: Callable[[Hashable], Prophet] | None = None,
     n_jobs: int = 1,
     on_error: str = 'raise',
+    fit_kwargs: _FitKwargs = None,
     **prophet_kwargs: Any,
 ) -> dict[Hashable, Prophet]:
     """Fit one Prophet model per series, solving all supported series together.
@@ -742,6 +759,12 @@ def fit_many(
     on_error: What to do when a series can't be fit (e.g. fewer than 2 non-NaN rows).
         'raise' (default): raise Prophet's error, with the series id prefixed to the
         message. 'skip': leave the series out of the result and log a warning naming it.
+    fit_kwargs: Keyword arguments for Prophet.fit, as one dict for all series or a
+        callable `fit_kwargs(series_id)` returning a dict (e.g. per-series warm starts:
+        `lambda sid: {'init': warm_start_params(old[sid])}`; with n_jobs != 1 it must be
+        picklable). Series fit by Stan get them as with Prophet.fit; every model stores
+        them in `fit_kwargs`, so cross_validation reuses them. The batched solvers don't
+        use them (they find the MAP directly).
     prophet_kwargs: Passed to Prophet() when make_model is not given.
 
     Returns
@@ -755,9 +778,21 @@ def fit_many(
         raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
     if on_error not in ('raise', 'skip'):
         raise ValueError(f"on_error must be 'raise' or 'skip', got {on_error!r}.")
+    if fit_kwargs is None:
+        kwargs_for = _no_fit_kwargs
+    elif callable(fit_kwargs):
+        kwargs_for = fit_kwargs
+    elif isinstance(fit_kwargs, dict):
+        fixed = fit_kwargs
+
+        def kwargs_for(series_id: Hashable) -> dict[str, Any]:
+            return fixed
+    else:
+        raise ValueError('fit_kwargs must be a dict or a callable series_id -> dict.')
     n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
     if n_jobs > 1:
-        return _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs, on_error)
+        return _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs, on_error,
+                                  fit_kwargs)
 
     share_dates = make_model is None
     if make_model is None:
@@ -767,7 +802,7 @@ def fit_many(
         raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
 
     order, batch, mult, constant, fallback, skipped = _prepare(
-        df, id_col, make_model, share_dates, on_error)
+        df, id_col, make_model, share_dates, on_error, kwargs_for)
     models = {sid: model for sid, model in constant}
 
     # Series are solved in groups of identical coordinate shape, so no series is padded
@@ -815,7 +850,7 @@ def fit_many(
     for sid, series_df, reason in fallback:
         logger.debug('Series %r falls back to Prophet.fit: %s', sid, reason)
         try:
-            models[sid] = make_model(sid).fit(series_df)
+            models[sid] = make_model(sid).fit(series_df, **kwargs_for(sid))
         except Exception as e:
             _series_failed(sid, e, on_error)
             if on_error == 'raise':
