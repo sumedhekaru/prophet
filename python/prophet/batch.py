@@ -560,7 +560,7 @@ def _prepare(
 ) -> tuple[
     list[Hashable],
     list[tuple[Hashable, Prophet, ModelInputData, np.ndarray]],
-    list[tuple[Hashable, Prophet, ModelInputData]],
+    list[tuple[Hashable, Prophet, ModelInputData, pd.DataFrame]],
     list[tuple[Hashable, Prophet]],
     list[tuple[Hashable, pd.DataFrame, str]],
 ]:
@@ -572,7 +572,7 @@ def _prepare(
     -------
     (order, batch, mult, constant, fallback): order lists the series ids; batch is a list
     of (id, model, inputs, Z) for purely additive models, mult a list of (id, model,
-    inputs) for models with multiplicative features, constant a list of (id, model),
+    inputs, series df) for models with multiplicative features, constant a list of (id, model),
     fallback a list of (id, series df, reason).
     """
     order, batch, mult, constant, fallback = [], [], [], [], []
@@ -604,7 +604,7 @@ def _prepare(
             set_constant_params(model, inputs.K)
             constant.append((sid, model))
         elif has_multiplicative_terms(inputs):
-            mult.append((sid, model, inputs))
+            mult.append((sid, model, inputs, series_df))
         else:
             batch.append((sid, model, inputs, cast(np.ndarray, Z)))  # additive: Z was built
     return order, batch, mult, constant, fallback
@@ -745,20 +745,24 @@ def fit_many(
     # series' full data; chunks keep memory bounded. Groups also share the length T: zero
     # time rows are exact in exact arithmetic, but BLAS rounding depends on the padded size.
     def mult_shape(
-        item: tuple[Hashable, Prophet, ModelInputData]
+        item: tuple[Hashable, Prophet, ModelInputData, pd.DataFrame]
     ) -> tuple[int, int, int, int]:
         s_m = np.asarray(item[2].s_m) != 0
         return (len(np.atleast_1d(item[2].t_change)), int((~s_m).sum()), int(s_m.sum()),
                 len(np.asarray(item[2].y)))
 
+    n_unsolved = 0
     for group in _group_by(mult, mult_shape):
         for start in range(0, len(group), _MULT_CHUNK):
             chunk = group[start:start + _MULT_CHUNK]
-            mb = _MultiplicativeBatch([inputs for _, _, inputs in chunk])
-            theta, ba, bm, sigma, lp, _ = mb.solve()
-            for b, (sid, model, _) in enumerate(chunk):
-                k, m, delta, beta = mb.unpack(b, theta, ba, bm)
-                set_params(model, k, m, delta, beta, sigma[b], lp[b])
+            results = _solve_multiplicative([inputs for _, _, inputs, _ in chunk])
+            for (sid, model, _, series_df), res in zip(chunk, results):
+                if isinstance(res, str):
+                    fallback.append((sid, series_df, res))
+                    n_unsolved += 1
+                    continue
+                k, m, delta, beta, sigma_obs, lp_b = res
+                set_params(model, k, m, delta, beta, sigma_obs, lp_b)
                 models[sid] = model
 
     for sid, series_df, reason in fallback:
@@ -767,8 +771,9 @@ def fit_many(
 
     logger.info(
         'fit_many: %d series batched (%d additive, %d multiplicative), %d constant, '
-        '%d fell back to Prophet.fit',
-        len(batch) + len(mult), len(batch), len(mult), len(constant), len(fallback),
+        '%d fell back to Prophet.fit (%d of them after the batched solver failed)',
+        len(batch) + len(mult) - n_unsolved, len(batch), len(mult) - n_unsolved,
+        len(constant), len(fallback), n_unsolved,
     )
     return {sid: models[sid] for sid in order}
 
@@ -942,6 +947,37 @@ def solve_map_multiplicative(
         if live.size == 0:
             break
     return theta, ba, bm, sigma, lp, it
+
+
+def _solve_multiplicative(
+    inputs_list: Sequence[ModelInputData],
+) -> list[tuple[float, float, np.ndarray, np.ndarray, float, float] | str]:
+    """Solve a chunk of equal-shape multiplicative problems, isolating failures.
+
+    If the batched solve raises LinAlgError, each series is solved alone. That gives
+    the same result as in the batch (the shapes are equal), so only the series that
+    fail on their own lose their batched fit.
+
+    Parameters
+    ----------
+    inputs_list: Model inputs of equal shape (see `mult_shape` in `fit_many`).
+
+    Returns
+    -------
+    Per series: (k, m, delta, beta, sigma_obs, lp), or a string saying why it failed.
+    """
+    mb = _MultiplicativeBatch(inputs_list)
+    try:
+        theta, ba, bm, sigma, lp, _ = mb.solve()
+    except np.linalg.LinAlgError as e:
+        if len(inputs_list) == 1:
+            return [f'multiplicative solver failed: {e}']
+        return [r for inputs in inputs_list for r in _solve_multiplicative([inputs])]
+    out: list[tuple[float, float, np.ndarray, np.ndarray, float, float] | str] = []
+    for b in range(len(inputs_list)):
+        k, m, delta, beta = mb.unpack(b, theta, ba, bm)
+        out.append((k, m, delta, beta, float(sigma[b]), float(lp[b])))
+    return out
 
 
 @dataclasses.dataclass
