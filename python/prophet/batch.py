@@ -560,17 +560,32 @@ def _preprocess_shared(
     )
 
 
+def _series_failed(sid: Hashable, e: Exception, on_error: str) -> None:
+    """Name the series in the error (on_error='raise'), or log that it is skipped.
+
+    For 'raise' the caller re-raises the same exception object, so its type and
+    traceback are kept.
+    """
+    if on_error == 'raise':
+        first = e.args[0] if e.args else ''
+        e.args = (f'series {sid!r}: {first}',) + tuple(e.args[1:])
+    else:
+        logger.warning('fit_many: skipping series %r: %s: %s', sid, type(e).__name__, e)
+
+
 def _prepare(
     df: pd.DataFrame,
     id_col: str,
     make_model: Callable[[Hashable], Prophet],
     share_dates: bool,
+    on_error: str = 'raise',
 ) -> tuple[
     list[Hashable],
     list[tuple[Hashable, Prophet, ModelInputData, np.ndarray, pd.DataFrame]],
     list[tuple[Hashable, Prophet, ModelInputData, pd.DataFrame]],
     list[tuple[Hashable, Prophet]],
     list[tuple[Hashable, pd.DataFrame, str]],
+    list[Hashable],
 ]:
     """Create and preprocess one model per series and sort them by how they are fit.
 
@@ -581,42 +596,50 @@ def _prepare(
     (order, batch, mult, constant, fallback): order lists the series ids; batch is a list
     of (id, model, inputs, Z, series df) for purely additive models, mult a list of (id, model,
     inputs, series df) for models with multiplicative features, constant a list of (id, model),
-    fallback a list of (id, series df, reason).
+    fallback a list of (id, series df, reason), skipped the ids of series that raised
+    (on_error='skip'; with 'raise' the error propagates, naming the series).
     """
-    order, batch, mult, constant, fallback = [], [], [], [], []
+    order, batch, mult, constant, fallback, skipped = [], [], [], [], [], []
     shared_by_dates = {}
     for sid, group in df.groupby(id_col, sort=False):
-        order.append(sid)
         series_df = group.drop(columns=id_col).reset_index(drop=True)
-        model = make_model(sid)
-        reason = unsupported_reason(model)
-        if reason is not None:
-            fallback.append((sid, series_df, reason))
+        try:
+            model = make_model(sid)
+            reason = unsupported_reason(model)
+            if reason is not None:
+                fallback.append((sid, series_df, reason))
+            else:
+                key = _history_key(series_df) if share_dates else None
+                shared = shared_by_dates.get(key) if key is not None else None
+                if shared is None:
+                    inputs = model.preprocess(series_df)
+                    Z = None if has_multiplicative_terms(inputs) else design_matrix(inputs)
+                    if key is not None:
+                        shared_by_dates[key] = _SharedFeatures(
+                            X=inputs.X, K=inputs.K, sigmas=inputs.sigmas,
+                            component_cols=cast(pd.DataFrame, model.train_component_cols),
+                            modes=cast(dict, model.component_modes),
+                            train_holiday_names=model.train_holiday_names, Z=Z,
+                        )
+                else:
+                    inputs = _preprocess_shared(model, series_df, shared)
+                    Z = shared.Z
+                if is_constant(model):
+                    set_constant_params(model, inputs.K)
+                    constant.append((sid, model))
+                elif has_multiplicative_terms(inputs):
+                    mult.append((sid, model, inputs, series_df))
+                else:
+                    # additive: Z was built
+                    batch.append((sid, model, inputs, cast(np.ndarray, Z), series_df))
+        except Exception as e:
+            _series_failed(sid, e, on_error)
+            if on_error == 'raise':
+                raise
+            skipped.append(sid)
             continue
-        key = _history_key(series_df) if share_dates else None
-        shared = shared_by_dates.get(key) if key is not None else None
-        if shared is None:
-            inputs = model.preprocess(series_df)
-            Z = None if has_multiplicative_terms(inputs) else design_matrix(inputs)
-            if key is not None:
-                shared_by_dates[key] = _SharedFeatures(
-                    X=inputs.X, K=inputs.K, sigmas=inputs.sigmas,
-                    component_cols=cast(pd.DataFrame, model.train_component_cols),
-                    modes=cast(dict, model.component_modes),
-                    train_holiday_names=model.train_holiday_names, Z=Z,
-                )
-        else:
-            inputs = _preprocess_shared(model, series_df, shared)
-            Z = shared.Z
-        if is_constant(model):
-            set_constant_params(model, inputs.K)
-            constant.append((sid, model))
-        elif has_multiplicative_terms(inputs):
-            mult.append((sid, model, inputs, series_df))
-        else:
-            # additive: Z was built
-            batch.append((sid, model, inputs, cast(np.ndarray, Z), series_df))
-    return order, batch, mult, constant, fallback
+        order.append(sid)
+    return order, batch, mult, constant, fallback, skipped
 
 
 def _group_by(items: Iterable[_T], key: Callable[[_T], Hashable]) -> list[list[_T]]:
@@ -632,11 +655,12 @@ def _fit_chunk(
     id_col: str,
     make_model: Callable[[Hashable], Prophet] | None,
     prophet_kwargs: dict[str, Any],
+    on_error: str,
 ) -> dict[Hashable, Prophet]:
     """Worker for fit_many(n_jobs > 1): fit one chunk of series in this process."""
     if make_model is None:
-        return fit_many(chunk_df, id_col=id_col, **prophet_kwargs)
-    return fit_many(chunk_df, id_col=id_col, make_model=make_model)
+        return fit_many(chunk_df, id_col=id_col, on_error=on_error, **prophet_kwargs)
+    return fit_many(chunk_df, id_col=id_col, make_model=make_model, on_error=on_error)
 
 
 def _fit_many_parallel(
@@ -645,6 +669,7 @@ def _fit_many_parallel(
     make_model: Callable[[Hashable], Prophet] | None,
     n_jobs: int,
     prophet_kwargs: dict[str, Any],
+    on_error: str,
 ) -> dict[Hashable, Prophet]:
     """fit_many with n_jobs > 1: fit contiguous chunks of series in a process pool."""
     if make_model is not None:
@@ -669,14 +694,15 @@ def _fit_many_parallel(
 
     ctx = multiprocessing.get_context('spawn')
     with ProcessPoolExecutor(max_workers=n_jobs, mp_context=ctx) as pool:
-        parts = list(pool.map(_fit_chunk, chunks, [id_col] * len(chunks),
-                              [make_model] * len(chunks), [prophet_kwargs] * len(chunks)))
+        n = len(chunks)
+        parts = list(pool.map(_fit_chunk, chunks, [id_col] * n, [make_model] * n,
+                              [prophet_kwargs] * n, [on_error] * n))
     models = {}
     for part in parts:
         models.update(part)
-    logger.info('fit_many: %d series in %d chunks on %d worker processes',
-                len(ids), len(chunks), n_jobs)
-    return {sid: models[sid] for sid in ids}
+    logger.info('fit_many: %d series in %d chunks on %d worker processes, %d skipped',
+                len(ids), len(chunks), n_jobs, len(ids) - len(models))
+    return {sid: models[sid] for sid in ids if sid in models}
 
 
 def fit_many(
@@ -684,6 +710,7 @@ def fit_many(
     id_col: str = 'unique_id',
     make_model: Callable[[Hashable], Prophet] | None = None,
     n_jobs: int = 1,
+    on_error: str = 'raise',
     **prophet_kwargs: Any,
 ) -> dict[Hashable, Prophet]:
     """Fit one Prophet model per series, solving all supported series together.
@@ -712,19 +739,25 @@ def fit_many(
         CPUs. The series are split into contiguous chunks, each fit like n_jobs=1, so
         results are bit-identical for any n_jobs. With n_jobs != 1, make_model must be
         picklable (a module-level function, not a lambda or closure).
+    on_error: What to do when a series can't be fit (e.g. fewer than 2 non-NaN rows).
+        'raise' (default): raise Prophet's error, with the series id prefixed to the
+        message. 'skip': leave the series out of the result and log a warning naming it.
     prophet_kwargs: Passed to Prophet() when make_model is not given.
 
     Returns
     -------
-    Dict mapping each series id to its fitted Prophet model, in order of first appearance.
+    Dict mapping each series id to its fitted Prophet model, in order of first appearance
+    (skipped series left out).
     """
     from prophet.forecaster import Prophet
 
     if make_model is not None and prophet_kwargs:
         raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
+    if on_error not in ('raise', 'skip'):
+        raise ValueError(f"on_error must be 'raise' or 'skip', got {on_error!r}.")
     n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else max(1, int(n_jobs))
     if n_jobs > 1:
-        return _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs)
+        return _fit_many_parallel(df, id_col, make_model, n_jobs, prophet_kwargs, on_error)
 
     share_dates = make_model is None
     if make_model is None:
@@ -733,7 +766,8 @@ def fit_many(
     elif prophet_kwargs:
         raise ValueError('Pass either make_model or Prophet keyword arguments, not both.')
 
-    order, batch, mult, constant, fallback = _prepare(df, id_col, make_model, share_dates)
+    order, batch, mult, constant, fallback, skipped = _prepare(
+        df, id_col, make_model, share_dates, on_error)
     models = {sid: model for sid, model in constant}
 
     # Series are solved in groups of identical coordinate shape, so no series is padded
@@ -780,15 +814,23 @@ def fit_many(
 
     for sid, series_df, reason in fallback:
         logger.debug('Series %r falls back to Prophet.fit: %s', sid, reason)
-        models[sid] = make_model(sid).fit(series_df)
+        try:
+            models[sid] = make_model(sid).fit(series_df)
+        except Exception as e:
+            _series_failed(sid, e, on_error)
+            if on_error == 'raise':
+                raise
+            skipped.append(sid)
 
     logger.info(
         'fit_many: %d series batched (%d additive, %d multiplicative), %d constant, '
-        '%d fell back to Prophet.fit (%d of them after the batched fit was rejected)',
+        '%d fell back to Prophet.fit (%d of them after the batched fit was rejected), '
+        '%d skipped',
         len(batch) + len(mult) - rejected_add - rejected_mult, len(batch) - rejected_add,
         len(mult) - rejected_mult, len(constant), len(fallback), rejected_add + rejected_mult,
+        len(skipped),
     )
-    return {sid: models[sid] for sid in order}
+    return {sid: models[sid] for sid in order if sid in models}
 
 
 def _gram(Z: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
