@@ -49,6 +49,10 @@ _KM_PRIOR_VAR = 25.0
 _MIN_SIGMA = 1e-9
 # Series per multiplicative solve (each needs its full T × p design in memory).
 _MULT_CHUNK = 16
+# A multiplicative fit is accepted if its block KKT violation (units of 1 / tau) is at most
+# this; otherwise the series is fit by Prophet.fit. Measured (D1.4.1): converged fits that
+# can't improve lp in float64 stay below 1e-4, unconverged ones are above 1e-2.
+_MULT_KKT_TOL = 1e-3
 
 
 def _feature_sign(
@@ -823,7 +827,7 @@ def solve_map_multiplicative(
     ridge_m: np.ndarray,
     tau: np.ndarray,
     tol: float = 0.0,
-    max_iter: int = 100,
+    max_iter: int = 1000,
     method: str = 'hybrid',
     switch_after: int = 10,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
@@ -956,7 +960,9 @@ def _solve_multiplicative(
 
     If the batched solve raises LinAlgError, each series is solved alone. That gives
     the same result as in the batch (the shapes are equal), so only the series that
-    fail on their own lose their batched fit.
+    fail on their own lose their batched fit. A solution is accepted only if its block
+    KKT violation is at most _MULT_KKT_TOL, so every accepted fit is a verified
+    stationary point.
 
     Parameters
     ----------
@@ -973,8 +979,12 @@ def _solve_multiplicative(
         if len(inputs_list) == 1:
             return [f'multiplicative solver failed: {e}']
         return [r for inputs in inputs_list for r in _solve_multiplicative([inputs])]
+    kkt = mb.kkt(theta, ba, bm, sigma)
     out: list[tuple[float, float, np.ndarray, np.ndarray, float, float] | str] = []
     for b in range(len(inputs_list)):
+        if not kkt[b] <= _MULT_KKT_TOL:  # also rejects NaN
+            out.append(f'multiplicative solver did not converge (block KKT {kkt[b]:.1e})')
+            continue
         k, m, delta, beta = mb.unpack(b, theta, ba, bm)
         out.append((k, m, delta, beta, float(sigma[b]), float(lp[b])))
     return out
@@ -1043,6 +1053,40 @@ class _MultiplicativeBatch:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
         return solve_map_multiplicative(self.ZT, self.Xa, self.Xm, self.y, self.T, self.delta_mask,
                                         self.ridge_a, self.ridge_m, self.tau, **kw)
+
+    def kkt(
+        self, theta: np.ndarray, ba: np.ndarray, bm: np.ndarray, sigma: np.ndarray
+    ) -> np.ndarray:
+        """Largest KKT violation per series over the two blocks the solver alternates.
+
+        Block (theta, beta_a) given beta_m, and block (beta_m, beta_a) given theta; both
+        must hold at a stationary point. Units of 1 / tau, as in `kkt_violation`.
+
+        Parameters
+        ----------
+        theta, ba, bm, sigma: A solution from `solve`.
+
+        Returns
+        -------
+        Violation per series, shape B (NaN if the solution is not finite).
+        """
+        B = theta.shape[0]
+        ridge_t = np.concatenate([np.full((B, 2), 1 / _KM_PRIOR_VAR),
+                                  np.where(self.delta_mask, 0.0, 1.0)], axis=1)
+        l1_t = np.concatenate([np.zeros((B, 2), bool), self.delta_mask], axis=1)
+        wgt = 1 + np.matmul(self.Xm, bm[:, :, None])[..., 0]
+        G, C, _ = _gram(np.concatenate([wgt[:, :, None] * self.ZT, self.Xa], axis=2), self.y)
+        k_a = kkt_violation(
+            G, C, np.concatenate([theta, ba], axis=1), sigma,
+            np.concatenate([ridge_t, self.ridge_a], axis=1),
+            np.concatenate([l1_t, np.zeros_like(self.ridge_a, bool)], axis=1), self.tau)
+        trend = np.matmul(self.ZT, theta[:, :, None])[..., 0]
+        G, C, _ = _gram(np.concatenate([trend[:, :, None] * self.Xm, self.Xa], axis=2),
+                        self.y - trend)
+        ridge_b = np.concatenate([self.ridge_m, self.ridge_a], axis=1)
+        k_b = kkt_violation(G, C, np.concatenate([bm, ba], axis=1), sigma, ridge_b,
+                            np.zeros_like(ridge_b, bool), self.tau)
+        return np.maximum(k_a, k_b)
 
     def unpack(
         self, b: int, theta: np.ndarray, ba: np.ndarray, bm: np.ndarray
