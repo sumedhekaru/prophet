@@ -188,6 +188,76 @@ class TestProphetFitPredictDefault:
             assert all(col in expected_cols for col in result.columns.tolist())
 
 
+class TestProphetPredictOptions:
+    INTERVALS = ["yhat_lower", "yhat_upper", "trend_lower", "trend_upper"]
+
+    @pytest.fixture(scope="class")
+    @staticmethod
+    def fitted(daily_univariate_ts):
+        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        m = Prophet(uncertainty_samples=200).fit(train)
+        return m, m.make_future_dataframe(periods=20)
+
+    def test_rng_is_reproducible_and_leaves_global_state(self, fitted):
+        m, future = fitted
+        np.random.seed(5)
+        state = np.random.get_state()[1].copy()
+        a = m.predict(future, rng=np.random.default_rng(1))
+        b = m.predict(future, rng=np.random.default_rng(1))
+        pd.testing.assert_frame_equal(a, b)
+        np.testing.assert_array_equal(np.random.get_state()[1], state)
+        c = m.predict(future, rng=np.random.default_rng(2))
+        assert not np.array_equal(a["yhat_upper"], c["yhat_upper"])
+
+    def test_default_is_unchanged(self, fitted):
+        m, future = fitted
+        np.random.seed(3)
+        a = m.predict(future)
+        np.random.seed(3)
+        b = m.predict(future, history_uncertainty=True, rng=None)
+        pd.testing.assert_frame_equal(a, b)
+
+    def test_history_uncertainty_false(self, fitted):
+        m, future = fitted
+        fc = m.predict(future, history_uncertainty=False, rng=np.random.default_rng(0))
+        hist = (fc["ds"] <= m.history["ds"].max()).to_numpy()
+        assert fc.loc[hist, self.INTERVALS].isna().all().all()
+        future_only = future[~hist].reset_index(drop=True)
+        ref = m.predict(future_only, rng=np.random.default_rng(0))
+        np.testing.assert_array_equal(fc.loc[~hist, self.INTERVALS].to_numpy(),
+                                      ref[self.INTERVALS].to_numpy())
+        np.testing.assert_array_equal(fc["yhat"].to_numpy(), m.predict(future)["yhat"].to_numpy())
+
+    def test_history_uncertainty_analytic(self, fitted):
+        from statistics import NormalDist
+
+        m, future = fitted
+        fc = m.predict(future, history_uncertainty="analytic", rng=np.random.default_rng(0))
+        ref = m.predict(future, history_uncertainty=False, rng=np.random.default_rng(0))
+        hist = (fc["ds"] <= m.history["ds"].max()).to_numpy()
+        z = NormalDist().inv_cdf((1 + m.interval_width) / 2)
+        half_width = z * m.params["sigma_obs"][0, 0] * m.y_scale
+        yhat = fc.loc[hist, "yhat"].to_numpy()
+        np.testing.assert_allclose(fc.loc[hist, "yhat_lower"], yhat - half_width, rtol=1e-12)
+        np.testing.assert_allclose(fc.loc[hist, "yhat_upper"], yhat + half_width, rtol=1e-12)
+        np.testing.assert_array_equal(fc.loc[hist, "trend_lower"], fc.loc[hist, "trend"])
+        np.testing.assert_array_equal(fc.loc[~hist, self.INTERVALS].to_numpy(),
+                                      ref.loc[~hist, self.INTERVALS].to_numpy())
+
+    def test_history_uncertainty_invalid(self, fitted):
+        m, future = fitted
+        for value in ["sampled", 1, None]:
+            with pytest.raises(ValueError, match="history_uncertainty must be"):
+                m.predict(future, history_uncertainty=value)
+
+    def test_history_uncertainty_analytic_needs_map(self, daily_univariate_ts):
+        m = Prophet(mcmc_samples=10).fit(
+            daily_univariate_ts.iloc[:100], chains=1, seed=1, show_progress=False
+        )
+        with pytest.raises(ValueError, match="requires a MAP fit"):
+            m.predict(history_uncertainty="analytic")
+
+
 class TestProphetDataPrep:
     def test_setup_dataframe(self, daily_univariate_ts, backend):
         """Test that the columns 't' and 'y_scaled' are added to the dataframe."""
