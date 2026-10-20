@@ -187,6 +187,35 @@ class TestProphetFitPredictDefault:
             ]
             assert all(col in expected_cols for col in result.columns.tolist())
 
+    def test_percentile_skip_constant_rows(self):
+        rng = np.random.default_rng(0)
+        samples = rng.normal(size=(6, 50))
+        samples[1] = 3.0  # constant row: every percentile is that value
+        samples[4, 7] = np.nan  # rows with NaNs are never treated as constant
+        q = [10.0, 90.0]
+        forecaster = Prophet()
+        result = forecaster._percentile_skip_constant_rows(samples, q)
+        expected = np.stack([forecaster.percentile(samples, p, axis=1) for p in q])
+        np.testing.assert_array_equal(result, expected)
+
+    def test_predict_uncertainty_bounds(self, daily_univariate_ts, backend):
+        train, _ = train_test_split(daily_univariate_ts, daily_univariate_ts.shape[0] // 2)
+        forecaster = Prophet(stan_backend=backend).fit(train)
+        df = forecaster.setup_dataframe(forecaster.make_future_dataframe(periods=30))
+        np.random.seed(0)
+        intervals = forecaster.predict_uncertainty(df, vectorized=True)
+        np.random.seed(0)
+        samples = forecaster.sample_posterior_predictive(df, vectorized=True)
+        lower_p = 100 * (1.0 - forecaster.interval_width) / 2
+        upper_p = 100 * (1.0 + forecaster.interval_width) / 2
+        for key in ["yhat", "trend"]:
+            np.testing.assert_array_equal(
+                intervals[f"{key}_lower"], forecaster.percentile(samples[key], lower_p, axis=1)
+            )
+            np.testing.assert_array_equal(
+                intervals[f"{key}_upper"], forecaster.percentile(samples[key], upper_p, axis=1)
+            )
+
 
 class TestProphetDataPrep:
     def test_setup_dataframe(self, daily_univariate_ts, backend):
