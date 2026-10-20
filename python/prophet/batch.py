@@ -62,6 +62,8 @@ _MULT_CHUNK = 16
 # this; otherwise the series is fit by Prophet.fit. Measured (D1.4.1): converged fits that
 # can't improve lp in float64 stay below 1e-4, unconverged ones are above 1e-2.
 _MULT_KKT_TOL = 1e-3
+# Initial Levenberg-Marquardt damping, relative to the largest diagonal entry of JᵀJ (E6).
+_MULT_LM_LAM0 = 1e-3
 
 
 def _feature_sign(
@@ -960,6 +962,11 @@ def solve_map_multiplicative(
     decrease. method='alternating': exact block solves, (θ, β_a) given β_m, then
     (β_m, β_a) given θ; also monotone, but can zig-zag for hundreds of iterations.
     The joint problem is non-convex (bilinear), so the result is a stationary point.
+    Each block or Gauss-Newton subproblem takes one exact w-step at the current sigma
+    (solve_map with max_outer=1) rather than iterating sigma to convergence: sigma is set
+    in closed form at every trial point anyway, so the fixed points are the same and the
+    hard cases run far faster. Gauss-Newton steps are damped (Levenberg-Marquardt), per
+    series, so that they stay local early on.
     Stops per series when lp changes by no more than `tol` (relative). With the default
     tol=0 that is when a step no longer improves lp (lp never decreases), which gives
     KKT violations around 1e-9 in about 8 Gauss-Newton iterations.
@@ -1003,6 +1010,7 @@ def solve_map_multiplicative(
             ridge_a[L], ridge_m[L], tau[L])
 
     lp = np.full(B, -np.inf)
+    lam = np.full(B, np.nan)  # Levenberg-Marquardt damping per series (Gauss-Newton phase)
     live = np.arange(B)
     it = 0
     for it in range(1, max_iter + 1):
@@ -1014,7 +1022,8 @@ def solve_map_multiplicative(
             wA, sigma[L] = solve_map(
                 G, C, yy, T[L], np.concatenate([ridge_T[L], ridge_a[L]], axis=1),
                 np.concatenate([l1_T[L], np.zeros((len(L), Ka), bool)], axis=1),
-                tau[L], w0=np.concatenate([theta[L], ba[L]], axis=1), sigma0=sigma[L])
+                tau[L], w0=np.concatenate([theta[L], ba[L]], axis=1), sigma0=sigma[L],
+                max_outer=1)
             theta[L], ba[L] = wA[:, :P], wA[:, P:]
             trend = np.matmul(ZT[L], theta[L][:, :, None])[..., 0]
             ZB = np.concatenate([trend[:, :, None] * Xm[L], Xa[L]], axis=2)
@@ -1022,7 +1031,7 @@ def solve_map_multiplicative(
             wB, sigma[L] = solve_map(
                 G, C, yy, T[L], np.concatenate([ridge_m[L], ridge_a[L]], axis=1),
                 np.zeros((len(L), Km + Ka), bool), tau[L],
-                w0=np.concatenate([bm[L], ba[L]], axis=1), sigma0=sigma[L])
+                w0=np.concatenate([bm[L], ba[L]], axis=1), sigma0=sigma[L], max_outer=1)
             bm[L], ba[L] = wB[:, :Km], wB[:, Km:]
             lp_new = lp_at(L, theta[L], ba[L], bm[L], sigma[L])
         else:
@@ -1035,8 +1044,15 @@ def solve_map_multiplicative(
             yhat = trend * mult + np.matmul(Xa[L], ba[L][:, :, None])[..., 0]
             y_lin = y[L] - yhat + np.matmul(J, p_cur[:, :, None])[..., 0]
             G, C, yy = _gram(J, y_lin)
-            p_new, _ = solve_map(G, C, yy, T[L], ridge_J[L], l1_J[L], tau[L],
-                                 w0=p_cur, sigma0=sigma[L])
+            # Levenberg-Marquardt damping lam * ||p - p_cur||^2 keeps early steps local (plain
+            # Gauss-Newton can jump to a worse stationary point); it leaves fixed points unchanged.
+            lam_L = np.where(np.isnan(lam[L]), _MULT_LM_LAM0 * np.einsum('bii->bi', G).max(axis=1),
+                             lam[L])
+            p_new, _ = solve_map(G + lam_L[:, None, None] * np.eye(G.shape[1]),
+                                 C + lam_L[:, None] * p_cur,
+                                 yy + lam_L * np.einsum('bp,bp->b', p_cur, p_cur), T[L],
+                                 ridge_J[L], l1_J[L], tau[L], w0=p_cur, sigma0=sigma[L],
+                                 max_outer=1)
             # Backtrack until the true log posterior doesn't decrease; sigma is set to its
             # closed-form optimum at each trial point.
             step = np.ones(len(L))
@@ -1059,6 +1075,9 @@ def solve_map_multiplicative(
                 if accepted.all():
                     break
                 step = np.where(accepted, step, step / 2)
+            # Less damping after a full step, more after a rejected one.
+            full = accepted & (step == 1.0)
+            lam[L] = np.where(full, lam_L / 10, np.where(accepted, lam_L, lam_L * 10))
             theta[L], ba[L], bm[L] = p_acc[:, :P], p_acc[:, P:P + Ka], p_acc[:, P + Ka:]
             sigma[L] = s_acc
             lp_new = lp_acc
