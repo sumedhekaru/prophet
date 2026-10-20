@@ -987,6 +987,8 @@ def _solve_multiplicative(
     except np.linalg.LinAlgError as e:
         if len(inputs_list) == 1:
             return [f'multiplicative solver failed: {e}']
+        logger.debug('Multiplicative chunk of %d series failed (%s); solving them one at a time',
+                     len(inputs_list), e)
         return [r for inputs in inputs_list for r in _solve_multiplicative([inputs])]
     kkt = mb.kkt(theta, ba, bm, sigma)
     out: list[tuple[float, float, np.ndarray, np.ndarray, float, float] | str] = []
