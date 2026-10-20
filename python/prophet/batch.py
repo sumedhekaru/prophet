@@ -676,6 +676,31 @@ def _fit_chunk(
                     fit_kwargs=fit_kwargs)
 
 
+def _split_stan_series(
+    ids: list[Hashable],
+    make_model: Callable[[Hashable], Prophet] | None,
+    prophet_kwargs: dict[str, Any],
+) -> tuple[list[Hashable], list[Hashable]]:
+    """Split series ids into those Prophet.fit will fit (by configuration) and the rest.
+
+    Only for scheduling: a series whose model can't even be built is left with the rest,
+    and its worker reports the error as fit_many would.
+    """
+    from prophet.forecaster import Prophet
+
+    if make_model is None:
+        stan = unsupported_reason(Prophet(**prophet_kwargs)) is not None
+        return (list(ids), []) if stan else ([], list(ids))
+    stan_ids, rest = [], []
+    for sid in ids:
+        try:
+            is_stan = unsupported_reason(make_model(sid)) is not None
+        except Exception:
+            is_stan = False
+        (stan_ids if is_stan else rest).append(sid)
+    return stan_ids, rest
+
+
 def _fit_many_parallel(
     df: pd.DataFrame,
     id_col: str,
@@ -698,12 +723,18 @@ def _fit_many_parallel(
             ) from e
     rows_by_id = df.groupby(id_col, sort=False).indices
     ids = list(rows_by_id)
-    n_chunks = min(len(ids), n_jobs * 2)
-    bounds = np.linspace(0, len(ids), n_chunks + 1).astype(int)
+    # Stan-fit series cost ~100x a batched one, so contiguous chunks could leave one worker
+    # with most of them. They go out first, as small tasks of their own; batched series keep
+    # contiguous chunks (results don't depend on chunk mates), enough of them to balance
+    # workers of different speeds.
+    stan_ids, batch_ids = _split_stan_series(ids, make_model, prophet_kwargs)
     chunks = []
-    for lo, hi in zip(bounds[:-1], bounds[1:]):
-        rows = np.concatenate([rows_by_id[sid] for sid in ids[lo:hi]])
-        chunks.append(df.iloc[np.sort(rows)])
+    for part in (stan_ids, batch_ids):
+        n_parts = min(len(part), n_jobs * 4)
+        bounds = np.linspace(0, len(part), n_parts + 1).astype(int)
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            rows = np.concatenate([rows_by_id[sid] for sid in part[lo:hi]])
+            chunks.append(df.iloc[np.sort(rows)])
 
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing
@@ -716,8 +747,8 @@ def _fit_many_parallel(
     models = {}
     for part in parts:
         models.update(part)
-    logger.info('fit_many: %d series in %d chunks on %d worker processes, %d skipped',
-                len(ids), len(chunks), n_jobs, len(ids) - len(models))
+    logger.info('fit_many: %d series (%d via Prophet.fit) in %d tasks on %d worker processes, '
+                '%d skipped', len(ids), len(stan_ids), len(chunks), n_jobs, len(ids) - len(models))
     return {sid: models[sid] for sid in ids if sid in models}
 
 
