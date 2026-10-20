@@ -47,6 +47,10 @@ _T = TypeVar('_T')
 _KM_PRIOR_VAR = 25.0
 # Smallest sigma_obs; same as Prophet.fit's value for a constant history.
 _MIN_SIGMA = 1e-9
+# A non-constant series whose fit reaches _MIN_SIGMA can be fit exactly (e.g. fewer rows than
+# parameters): the posterior grows without bound as sigma -> 0, so there is no MAP, and at this
+# sigma the priors are below rounding, leaving an arbitrary exact fit. Prophet.fit takes over.
+_PERFECT_FIT = 'perfect fit: sigma_obs reached its floor, no finite MAP'
 # Series per multiplicative solve (each needs its full T × p design in memory).
 _MULT_CHUNK = 16
 # A multiplicative fit is accepted if its block KKT violation (units of 1 / tau) is at most
@@ -563,7 +567,7 @@ def _prepare(
     share_dates: bool,
 ) -> tuple[
     list[Hashable],
-    list[tuple[Hashable, Prophet, ModelInputData, np.ndarray]],
+    list[tuple[Hashable, Prophet, ModelInputData, np.ndarray, pd.DataFrame]],
     list[tuple[Hashable, Prophet, ModelInputData, pd.DataFrame]],
     list[tuple[Hashable, Prophet]],
     list[tuple[Hashable, pd.DataFrame, str]],
@@ -575,7 +579,7 @@ def _prepare(
     Returns
     -------
     (order, batch, mult, constant, fallback): order lists the series ids; batch is a list
-    of (id, model, inputs, Z) for purely additive models, mult a list of (id, model,
+    of (id, model, inputs, Z, series df) for purely additive models, mult a list of (id, model,
     inputs, series df) for models with multiplicative features, constant a list of (id, model),
     fallback a list of (id, series df, reason).
     """
@@ -610,7 +614,8 @@ def _prepare(
         elif has_multiplicative_terms(inputs):
             mult.append((sid, model, inputs, series_df))
         else:
-            batch.append((sid, model, inputs, cast(np.ndarray, Z)))  # additive: Z was built
+            # additive: Z was built
+            batch.append((sid, model, inputs, cast(np.ndarray, Z), series_df))
     return order, batch, mult, constant, fallback
 
 
@@ -735,12 +740,17 @@ def fit_many(
     # to another's size. Each series' arithmetic then depends only on its own data,
     # which makes results bit-identical however the series are batched (and so for any
     # n_jobs).
+    rejected_add = rejected_mult = 0
     for group in _group_by(batch, lambda item: (len(item[2].t_change), item[2].K)):
-        problems = [(Z, inputs.y, inputs.sigmas, inputs.tau) for _, _, inputs, Z in group]
+        problems = [(Z, inputs.y, inputs.sigmas, inputs.tau) for _, _, inputs, Z, _ in group]
         layout, G, C, yy, T, ridge, l1, tau = stack_problems(problems)
         w, sigma = solve_map(G, C, yy, T, ridge, l1, tau)
         lp = log_posterior(G, C, yy, T, w, sigma, ridge, l1, tau)
-        for b, (sid, model, _, _) in enumerate(group):
+        for b, (sid, model, _, _, series_df) in enumerate(group):
+            if sigma[b] <= _MIN_SIGMA:
+                fallback.append((sid, series_df, _PERFECT_FIT))
+                rejected_add += 1
+                continue
             k, m, delta, beta = layout.unpack(w[b], b)
             set_params(model, k, m, delta, beta, sigma[b], lp[b])
             models[sid] = model
@@ -755,7 +765,6 @@ def fit_many(
         return (len(np.atleast_1d(item[2].t_change)), int((~s_m).sum()), int(s_m.sum()),
                 len(np.asarray(item[2].y)))
 
-    n_unsolved = 0
     for group in _group_by(mult, mult_shape):
         for start in range(0, len(group), _MULT_CHUNK):
             chunk = group[start:start + _MULT_CHUNK]
@@ -763,7 +772,7 @@ def fit_many(
             for (sid, model, _, series_df), res in zip(chunk, results):
                 if isinstance(res, str):
                     fallback.append((sid, series_df, res))
-                    n_unsolved += 1
+                    rejected_mult += 1
                     continue
                 k, m, delta, beta, sigma_obs, lp_b = res
                 set_params(model, k, m, delta, beta, sigma_obs, lp_b)
@@ -775,9 +784,9 @@ def fit_many(
 
     logger.info(
         'fit_many: %d series batched (%d additive, %d multiplicative), %d constant, '
-        '%d fell back to Prophet.fit (%d of them after the batched solver failed)',
-        len(batch) + len(mult) - n_unsolved, len(batch), len(mult) - n_unsolved,
-        len(constant), len(fallback), n_unsolved,
+        '%d fell back to Prophet.fit (%d of them after the batched fit was rejected)',
+        len(batch) + len(mult) - rejected_add - rejected_mult, len(batch) - rejected_add,
+        len(mult) - rejected_mult, len(constant), len(fallback), rejected_add + rejected_mult,
     )
     return {sid: models[sid] for sid in order}
 
@@ -962,7 +971,7 @@ def _solve_multiplicative(
     the same result as in the batch (the shapes are equal), so only the series that
     fail on their own lose their batched fit. A solution is accepted only if its block
     KKT violation is at most _MULT_KKT_TOL, so every accepted fit is a verified
-    stationary point.
+    stationary point, and only if sigma_obs is above its floor (see _PERFECT_FIT).
 
     Parameters
     ----------
@@ -984,6 +993,9 @@ def _solve_multiplicative(
     for b in range(len(inputs_list)):
         if not kkt[b] <= _MULT_KKT_TOL:  # also rejects NaN
             out.append(f'multiplicative solver did not converge (block KKT {kkt[b]:.1e})')
+            continue
+        if sigma[b] <= _MIN_SIGMA:
+            out.append(_PERFECT_FIT)
             continue
         k, m, delta, beta = mb.unpack(b, theta, ba, bm)
         out.append((k, m, delta, beta, float(sigma[b]), float(lp[b])))
