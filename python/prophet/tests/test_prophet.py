@@ -398,6 +398,59 @@ class TestProphetTrendComponent:
         y = model.flat_trend(t, m)
         assert (y - y_true).sum() == 0.0
 
+    def test_logistic_uncertainty_matches_every_step_loop(self, backend):
+        """Skipping the steps where no slope changes gives the same draws."""
+
+        def every_step(model, mat, deltas, k, m, cap, t_time, n_length, sd):
+            hist_mat, hist_time = model._make_historical_mat_time(
+                deltas, model.changepoints_t, t_time, len(mat), sd
+            )
+            mat = np.concatenate([hist_mat, mat], axis=1)
+            full_t = np.concatenate([hist_time, t_time])
+            k_cum = np.concatenate(
+                (np.ones((mat.shape[0], 1)) * k,
+                 np.where(mat, np.cumsum(mat, axis=1) + k, 0)),
+                axis=1,
+            )
+            idx = np.where(k_cum != 0, np.arange(k_cum.shape[1]), 0)
+            np.maximum.accumulate(idx, axis=1, out=idx)
+            k_cum_b = k_cum[np.arange(idx.shape[0])[:, None], idx]
+            gammas = np.zeros_like(mat)
+            for i in range(mat.shape[1]):
+                x = full_t[i] - m - np.sum(gammas[:, :i], axis=1)
+                ks = 1 - k_cum_b[:, i] / k_cum_b[:, i + 1]
+                gammas[:, i] = x * ks
+            k_t = (mat.cumsum(axis=1) + k)[:, -n_length:]
+            m_t = (gammas.cumsum(axis=1) + m)[:, -n_length:]
+            trends = cap / (1 + np.exp(-k_t * (t_time - m_t)))
+            return trends - trends.mean(axis=0)
+
+        rng = np.random.default_rng(0)
+        for _ in range(50):
+            hist = int(rng.choice([30, 365, 1500]))
+            horizon = int(rng.choice([1, 28, 200]))
+            n_cp = int(rng.choice([0, 5, 25]))
+            sd = 1.0 / hist
+            model = Prophet(growth="logistic", stan_backend=backend)
+            model.changepoints_t = np.sort(rng.uniform(0.02, 0.8, n_cp))
+            deltas = rng.laplace(0, 0.05, n_cp)
+            deltas[rng.random(n_cp) < 0.3] = 0.0
+            mean_delta = np.mean(np.abs(deltas)) + 1e-8 if n_cp else 1e-8
+            np.random.seed(int(rng.integers(2**31)))
+            mat = model._make_trend_shift_matrix(
+                mean_delta, n_cp * sd, horizon, n_samples=200
+            )
+            args = dict(
+                mat=mat, deltas=deltas, k=float(rng.normal(0, 1)),
+                m=float(rng.uniform(-0.5, 1)),
+                cap=rng.uniform(0.5, 3) * np.ones(horizon),
+                t_time=1 + np.arange(1, horizon + 1) * sd,
+                n_length=horizon,
+            )
+            expected = every_step(model, sd=sd, **args)
+            result = model._logistic_uncertainty(single_diff=sd, **args)
+            assert np.array_equal(result, expected)
+
     def test_get_changepoints(self, daily_univariate_ts, backend):
         """
         By default, Prophet uses the first 80% of the history to detect changepoints.

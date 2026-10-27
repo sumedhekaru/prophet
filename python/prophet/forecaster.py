@@ -2226,10 +2226,12 @@ class Prophet:
         k_cum = np.concatenate((np.ones((mat.shape[0], 1)) * k, np.where(mat, np.cumsum(mat, axis=1) + k, 0)), axis=1)
         k_cum_b = ffill(k_cum)
         gammas = np.zeros_like(mat)
-        for i in range(mat.shape[1]):
+        ks = 1 - k_cum_b[:, :-1] / k_cum_b[:, 1:]
+        # gamma is 0 wherever no path changes its slope (ks == 0), as is most
+        # of the history, so only those steps are computed (same arithmetic)
+        for i in np.flatnonzero((ks != 0).any(axis=0)):
             x = full_t_time[i] - m - np.sum(gammas[:, :i], axis=1)
-            ks = 1 - k_cum_b[:, i] / k_cum_b[:, i + 1]
-            gammas[:, i] = x * ks
+            gammas[:, i] = x * ks[:, i]
         # the data before the -n_length is the historical values, which are not needed, so cut the last n_length
         k_t = (mat.cumsum(axis=1) + k)[:, -n_length:]
         m_t = (gammas.cumsum(axis=1) + m)[:, -n_length:]
